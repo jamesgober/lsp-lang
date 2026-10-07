@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lsp-lang"
-version = "0.1.0"
+version = "1.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,13 +16,13 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Language Server Protocol scaffolding."
+description = "Language Server Protocol scaffolding: JSON-RPC transport, server lifecycle, incremental document sync, and diagnostics publishing."
 
 # Keywords (5 max)
-keywords = [language,lsp,editor,tooling]
+keywords = ["lsp", "language-server", "editor", "language", "tooling"]
 
 # Categories
-categories = [development-tools,development-tools::build-utils]
+categories = ["development-tools", "text-editors"]
 
 # Links
 homepage      = "https://github.com/jamesgober/lsp-lang"
@@ -41,19 +41,28 @@ name = "lsp_lang"
 path = "src/lib.rs"
 
 
-# FEATURE FLAGS
-# #################################
-[features]
-default = ["std"]
-std = []
-# Serialization support.
-serde = ["dep:serde"]
-
-
 # DEPENDENCIES
 # #################################
 [dependencies]
-serde = { version = "1", optional = true, default-features = false, features = ["derive", "alloc"] }
+# The family's incremental reparser. Every open document is an
+# `incremental_lang::Document`, so a keystroke reparses only the node around it.
+# Its `Grammar` is how a language plugs in; re-exported so versions always match.
+incremental-lang = { version = "1", default-features = false, features = ["std"] }
+# The family's diagnostic type. `Context::publish_diagnostics` converts
+# `diag_lang::Diagnostic` values to protocol diagnostics directly, so any stage
+# built on diag-lang (lexer, parser, resolver, checker) publishes as-is. Only
+# the type is used; the terminal renderer's colour support is left off.
+diag-lang = { version = "1", default-features = false, features = ["std"] }
+# The wire format. JSON-RPC envelopes are parsed in place, borrowing method
+# names and keeping parameters as raw JSON (`raw_value`) until a handler asks
+# for them in the type it wants, so no intermediate value tree is ever built.
+serde_json = { version = "1", features = ["raw_value"] }
+# Derives the private, borrowing deserializers for the messages the server
+# handles itself (initialize, document open/change/close, responses).
+serde = { version = "1", features = ["derive"] }
+# SIMD search for line breaks when indexing a document's lines. Already in the
+# dependency graph through `serde_json`.
+memchr = "2"
 
 
 # DEV DEPENDENCIES
@@ -61,9 +70,10 @@ serde = { version = "1", optional = true, default-features = false, features = [
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
 proptest  = "1"
-
-[target.'cfg(loom)'.dev-dependencies]
-loom = "0.7"
+# The examples resolve names with the family's symbol table and publish its
+# diagnostics, showing that the integration needs no adapter.
+symbol-lang = "1"
+intern-lang = "1"
 
 
 # BENCHMARKS
