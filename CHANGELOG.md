@@ -21,6 +21,62 @@
 
 ---
 
+## [1.0.1] - 2026-10-08
+
+A robustness patch (ISSUES M74, M75). A failed edit no longer drops the
+document, and a panic in a handler no longer ends the session. The public API
+is unchanged; the behaviour below changes only where 1.0.0 was wrong.
+
+### Changed
+
+- A `didChange` that cannot be applied keeps the document instead of dropping
+  it. If an edit's incremental reparse fails (a grammar panic or contract
+  break in the reparsed fragment), the edit is applied again by parsing the
+  whole new text, and a warning is logged. If the change cannot be applied at
+  all (an edit names a line the document does not have, a ranged change's
+  version does not increase, the grammar fails on the whole text, or the text
+  would outgrow 4 GiB), the document keeps its last good text, tree, and
+  version, is marked out of step, and the reason is logged; `changed` and
+  `closed` are not called. A whole-text change or a reopen brings it back in
+  step. A `didChange` is all or nothing: a failure partway restores the text
+  it started from.
+- A failed reopen keeps the open document (out of step) instead of dropping
+  it and calling `Handler::closed`. A failed first open is remembered, so a
+  whole-text change can still open the document.
+- An edit whose range names a line more than one past the document's last is
+  no longer clamped to the end of the text: it takes the document out of step.
+  The line just past the last still means the end of the text, and columns
+  past the end of a line are still clamped, as the protocol prescribes.
+- Everything a handler sends during `initialize` is held back and written
+  after the `initialize` response. If `initialize` fails, it is discarded, and
+  requests among it are forgotten.
+- At most 1024 of the server's own requests await an answer at once. Sending
+  one more cancels the oldest: the server sends `$/cancelRequest` for it and
+  delivers `RequestCancelled` to `Handler::response`. Settling an answer is
+  O(log n) (was O(n) over an unbounded list).
+- A grammar panic's message is included in the log line.
+
+### Fixed
+
+- A panic in `Handler::request`, `notification`, `changed`, `closed`,
+  `response`, or `initialize` unwound out of `Server::run` and ended the
+  session. Every handler call is now contained (where panics unwind): a
+  request is answered with `InternalError` carrying the panic's message
+  (clipped to 256 bytes), any other panic is logged as an error, and the
+  session carries on.
+- A failed edit dropped the document, so every later `didChange` was logged
+  as "not open" and language features stopped for that file until the editor
+  reopened it.
+- A handler could send requests and notifications before the `initialize`
+  response, which the protocol forbids.
+- The server's outstanding requests were an unbounded list with a linear
+  scan per answer.
+- A request whose envelope could not be read (a `method` that is not a
+  string, say) was answered under a `null` id even when its `id` was valid;
+  it is now answered under that id.
+
+---
+
 ## [1.0.0] - 2026-10-07
 
 The API freeze. The public surface is unchanged from 0.2.0 and is now the
@@ -170,7 +226,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lsp-lang/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsp-lang/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/jamesgober/lsp-lang/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/lsp-lang/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/jamesgober/lsp-lang/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/jamesgober/lsp-lang/releases/tag/v0.1.0

@@ -34,6 +34,14 @@ use crate::{
 /// O(1)) and hand it to a worker, reporting back through
 /// [`Context::notify`] on a later call.
 ///
+/// A panic in any method is contained where panics unwind: a request is
+/// answered with [`INTERNAL_ERROR`](ResponseError::INTERNAL_ERROR) carrying
+/// the panic's message, a panic anywhere else is logged to the client
+/// (`window/logMessage`), and the session carries on with the same handler.
+/// Messages the handler sent before panicking are still sent. The handler's
+/// own state is whatever the panic left. (With `panic = "abort"` the process
+/// ends instead, as that setting asks.)
+///
 /// `G` is the grammar every document is parsed with; see
 /// [`incremental_lang::Grammar`].
 ///
@@ -120,13 +128,15 @@ pub trait Handler<G: Grammar> {
     /// Returning an error refuses the `initialize` request; the session stays
     /// uninitialized and the client may try again.
     ///
-    /// Anything sent through `cx` here reaches the client before the
-    /// `initialize` response. The protocol allows only `window/logMessage`,
-    /// `window/showMessage`, `window/showMessageRequest`, `telemetry/event`,
-    /// and `$/progress` at this point; wait for the `initialized`
-    /// notification (see [`notification`](Handler::notification)) before
-    /// anything else, such as registering capabilities or asking for
-    /// configuration.
+    /// Anything sent through `cx` here is held back and reaches the client
+    /// right after the `initialize` response, in the order sent — the
+    /// protocol lets a server send nothing else before it has answered. If
+    /// `initialize` fails (an error, or a panic), the session stays
+    /// uninitialized and what was sent is discarded, never written; a request
+    /// among it is forgotten and gets no [`response`](Handler::response).
+    /// Even so, wait for the `initialized` notification (see
+    /// [`notification`](Handler::notification)) before registering
+    /// capabilities or asking for configuration, as the protocol advises.
     ///
     /// The default returns `{}`: a server with document sync and nothing else.
     ///
@@ -166,12 +176,20 @@ pub trait Handler<G: Grammar> {
     /// [`Context::publish_diagnostics`]. A `didChange` carrying several edits
     /// produces one call, after all of them are applied.
     ///
-    /// If the client's text could not be applied — the grammar's lexer broke
-    /// its contract, the grammar panicked, or the text outgrew 4 GiB — the
-    /// document is dropped instead, an error is logged to the client
-    /// (`window/logMessage`), and [`closed`](Handler::closed) is called rather
-    /// than this method. (A grammar panic is contained only where panics
-    /// unwind; with `panic = "abort"` the process ends.)
+    /// If an edit's incremental reparse fails — the grammar panicked or its
+    /// lexer broke its contract on the reparsed fragment — the server applies
+    /// the edit again by parsing the whole new text, logs a warning, and calls
+    /// this method as usual. If the change cannot be applied at all — an edit
+    /// names a line the document does not have, the version does not
+    /// increase, the grammar fails on the whole text too, or the text would
+    /// outgrow 4 GiB — the document is kept at its last good state (text,
+    /// tree, and version), marked out of step with the client, and the reason
+    /// is logged (`window/logMessage`); this method is not called. Ranged
+    /// changes to it are then ignored (and logged) until a whole-text change,
+    /// or a reopen, brings it back in step, which calls this method again. The
+    /// document is never dropped on a failed change. (A grammar panic is
+    /// contained only where panics unwind; with `panic = "abort"` the process
+    /// ends.)
     ///
     /// # Examples
     ///
@@ -314,6 +332,13 @@ pub trait Handler<G: Grammar> {
     /// request still awaiting one — a second answer, an id the server never
     /// sent, or an answer with no id — is logged to the client and dropped. The
     /// server never replies to an answer.
+    ///
+    /// At most 1024 requests await an answer at once (see
+    /// [`Context::request`]). When a new request would exceed that, the oldest
+    /// is cancelled: this method receives
+    /// [`REQUEST_CANCELLED`](ResponseError::REQUEST_CANCELLED) for it, after
+    /// the call that sent the new request returns, and a late answer from the
+    /// client is dropped.
     ///
     /// The default ignores them.
     ///

@@ -82,6 +82,13 @@ impl Handler<Lisp> for Recorder {
     ) -> Result<Reply, ResponseError> {
         match method {
             "test/echo" => Ok(Reply::new(&params.parse::<Value>()?)?),
+            "test/text" => {
+                let uri: String = params.parse()?;
+                let doc = cx
+                    .document(&uri)
+                    .ok_or_else(|| ResponseError::new(ResponseError::REQUEST_FAILED, "not open"))?;
+                Ok(Reply::new(&(doc.version(), doc.text()))?)
+            }
             "test/position" => {
                 let p: (String, u32) = params.parse()?;
                 let doc = cx
@@ -686,16 +693,106 @@ fn test_did_change_several_edits_apply_in_order_with_one_call() {
 }
 
 #[test]
-fn test_did_change_out_of_range_positions_are_clamped() {
+fn test_did_change_out_of_range_columns_clamp_but_missing_lines_go_out_of_step() {
     let mut client = Client::new();
     client
         .initialize(&[])
         .open(URI, "ab\ncd")
-        .edit(URI, 2, (0, 99), (0, 99), "!") // past the end of line 0
-        .edit(URI, 3, (50, 0), (60, 0), "?") // past the last line
+        .edit(URI, 2, (0, 99), (0, 99), "!") // past the end of line 0: clamped
+        .edit(URI, 3, (2, 0), (2, 9), "?") // the line just past the last: the end
+        .edit(URI, 4, (50, 0), (60, 0), "X") // lines this copy does not have
+        .edit(URI, 5, (0, 0), (0, 0), "Y") // ignored while out of step
+        .request("test/text", json!(URI))
         .shutdown();
-    let (server, _, _) = run(recorder(), &client);
-    assert_eq!(server.handler().changes[2].2, "ab!\ncd?");
+    let (server, result, out) = run(recorder(), &client);
+    assert!(result.is_ok());
+    let texts: Vec<&str> = server
+        .handler()
+        .changes
+        .iter()
+        .map(|c| c.2.as_str())
+        .collect();
+    assert_eq!(texts, ["ab\ncd", "ab!\ncd", "ab!\ncd?"]);
+    // The document is kept at its last good state, not dropped.
+    assert!(server.handler().closed.is_empty());
+    assert_eq!(response(&out, 2)["result"], json!([3, "ab!\ncd?"]));
+    let logs = logs(&out);
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().all(|(kind, _)| *kind == 2));
+    assert!(logs[0].1.contains("out of step") && logs[0].1.contains("does not have"));
+    assert!(logs[1].1.contains("ignored a change"));
+}
+
+#[test]
+fn test_out_of_step_document_resyncs_on_a_whole_text_change() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .open(URI, "(a)")
+        .edit(URI, 2, (9, 0), (9, 0), "lost") // out of step from here
+        .edit(URI, 3, (0, 0), (0, 0), "x"); // ignored
+    // The whole text brings it back in step, and edits after it in the same
+    // change apply on top of it; the edit before it is superseded.
+    let ranged = json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "text": ";" });
+    client.notify(
+        "textDocument/didChange",
+        json!({ "textDocument": { "uri": URI, "version": 4 }, "contentChanges": [ranged, { "text": "(b)" }, ranged] }),
+    );
+    client
+        .edit(URI, 5, (0, 4), (0, 4), "!")
+        .request("test/text", json!(URI))
+        .shutdown();
+    let (server, result, out) = run(recorder(), &client);
+    assert!(result.is_ok());
+    let changes: Vec<(i32, &str)> = server
+        .handler()
+        .changes
+        .iter()
+        .map(|c| (c.1, c.2.as_str()))
+        .collect();
+    assert_eq!(changes, [(1, "(a)"), (4, ";(b)"), (5, ";(b)!")]);
+    assert_eq!(response(&out, 2)["result"], json!([5, ";(b)!"]));
+}
+
+#[test]
+fn test_did_change_with_a_stale_version_goes_out_of_step() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .open(URI, "(a)")
+        .edit(URI, 2, (0, 1), (0, 2), "b")
+        .edit(URI, 2, (0, 1), (0, 2), "c") // a repeat of version 2
+        .edit(URI, 3, (0, 1), (0, 2), "d") // ignored: out of step
+        .request("test/text", json!(URI))
+        .shutdown();
+    let (server, result, out) = run(recorder(), &client);
+    assert!(result.is_ok());
+    assert_eq!(server.handler().changes.len(), 2);
+    assert_eq!(response(&out, 2)["result"], json!([2, "(b)"]));
+    let logs = logs(&out);
+    assert_eq!(logs.len(), 2);
+    assert!(logs[0].1.contains("version 2 arrived after version 2"));
+    assert_eq!(logs[0].0, 2);
+}
+
+#[test]
+fn test_did_change_failing_partway_restores_the_starting_text() {
+    let mut client = Client::new();
+    client.initialize(&[]).open(URI, "abc");
+    let edit = |line: u32, character: u32, text: &str| json!({ "range": { "start": { "line": line, "character": character }, "end": { "line": line, "character": character } }, "text": text });
+    client.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": URI, "version": 2 },
+            "contentChanges": [edit(0, 0, "1"), edit(0, 0, "2"), edit(7, 0, "lost")],
+        }),
+    );
+    client.request("test/text", json!(URI)).shutdown();
+    let (server, result, out) = run(recorder(), &client);
+    assert!(result.is_ok());
+    assert_eq!(server.handler().changes.len(), 1);
+    // Not "21abc": the first two edits were rolled back with the third.
+    assert_eq!(response(&out, 2)["result"], json!([1, "abc"]));
 }
 
 #[test]
@@ -838,13 +935,13 @@ impl Grammar for Gappy {
 
 #[derive(Default)]
 struct GappyRecorder {
-    changed: usize,
+    changed: Vec<(i32, String)>,
     closed: Vec<String>,
 }
 
 impl Handler<Gappy> for GappyRecorder {
-    fn changed(&mut self, _: &Document<Gappy>, _: &mut Context<'_, Gappy>) {
-        self.changed += 1;
+    fn changed(&mut self, doc: &Document<Gappy>, _: &mut Context<'_, Gappy>) {
+        self.changed.push((doc.version(), doc.text().to_owned()));
     }
     fn closed(&mut self, uri: &str, cx: &mut Context<'_, Gappy>) {
         self.closed.push(uri.to_owned());
@@ -853,43 +950,58 @@ impl Handler<Gappy> for GappyRecorder {
 }
 
 #[test]
-fn test_unapplicable_edit_drops_the_document_logs_and_calls_closed() {
+fn test_unparsable_edit_keeps_the_last_good_state_until_resynced() {
     let mut client = Client::new();
     client
         .initialize(&[])
         .open(URI, "abc")
-        .edit(URI, 2, (0, 1), (0, 1), "!")
-        .edit(URI, 3, (0, 0), (0, 0), "z") // the document is gone now
-        .shutdown();
+        .edit(URI, 2, (0, 1), (0, 1), "!") // the grammar cannot lex `!`
+        .edit(URI, 3, (0, 0), (0, 0), "z"); // ignored: out of step
+    client.notify(
+        "textDocument/didChange",
+        json!({ "textDocument": { "uri": URI, "version": 4 }, "contentChanges": [{ "text": "fine" }] }),
+    );
+    client.shutdown();
     let mut server = Server::new(Gappy, GappyRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
-    assert_eq!(server.handler().changed, 1);
-    assert_eq!(server.handler().closed, [URI]);
+    // Never dropped: no `closed`, and the whole-text change brought it back.
+    assert!(server.handler().closed.is_empty());
+    assert_eq!(
+        server.handler().changed,
+        [(1, "abc".to_owned()), (4, "fine".to_owned())]
+    );
     let out = messages(&output);
     let logs = logs(&out);
     assert_eq!(logs.len(), 2);
-    assert_eq!(logs[0].0, 1);
-    assert!(logs[0].1.contains("could not be applied"));
-    assert_eq!(logs[1].0, 2); // the later change targets a closed document
+    assert_eq!(logs[0].0, 1); // a grammar bug is an error
+    assert!(logs[0].1.contains("could not be parsed") && logs[0].1.contains("keeping version 1"));
+    assert_eq!(logs[1].0, 2); // the ignored change is a warning
 }
 
 #[test]
-fn test_failed_reopen_is_logged_and_drops_the_open_version() {
+fn test_failed_reopen_keeps_the_open_version_out_of_step() {
     let mut client = Client::new();
     client
         .initialize(&[])
         .open(URI, "ok")
         .open(URI, "not ok!")
+        .edit(URI, 2, (0, 0), (0, 0), "x") // ignored: out of step
+        .open(URI, "ok again")
         .shutdown();
     let mut server = Server::new(Gappy, GappyRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
-    // The first version opened; the failed reopen dropped it and said so.
-    assert_eq!(server.handler().changed, 1);
-    assert_eq!(server.handler().closed, [URI]);
+    assert!(server.handler().closed.is_empty());
+    assert_eq!(
+        server.handler().changed,
+        [(1, "ok".to_owned()), (1, "ok again".to_owned())]
+    );
     let out = messages(&output);
-    assert!(logs(&out)[0].1.contains("could not open"));
+    let logs = logs(&out);
+    assert_eq!(logs.len(), 2);
+    assert!(logs[0].1.contains("could not reopen") && logs[0].1.contains("keeping version 1"));
+    assert!(logs[1].1.contains("out of step"));
 }
 
 /// A grammar whose lexer panics on `#` — a bug in a language's grammar.
@@ -910,13 +1022,14 @@ impl Grammar for Panicky {
 
 #[derive(Default)]
 struct PanickyRecorder {
-    changed: usize,
+    changed: Vec<(String, i32, String)>,
     closed: Vec<String>,
 }
 
 impl Handler<Panicky> for PanickyRecorder {
-    fn changed(&mut self, _: &Document<Panicky>, _: &mut Context<'_, Panicky>) {
-        self.changed += 1;
+    fn changed(&mut self, doc: &Document<Panicky>, _: &mut Context<'_, Panicky>) {
+        self.changed
+            .push((doc.uri().to_owned(), doc.version(), doc.text().to_owned()));
     }
     fn closed(&mut self, uri: &str, _: &mut Context<'_, Panicky>) {
         self.closed.push(uri.to_owned());
@@ -924,34 +1037,118 @@ impl Handler<Panicky> for PanickyRecorder {
 }
 
 #[test]
-fn test_grammar_panic_costs_the_document_not_the_session() {
+fn test_grammar_panic_costs_neither_the_document_nor_the_session() {
     let other = "file:///other.lisp";
     let mut client = Client::new();
     client
         .initialize(&[])
         .open(URI, "abc")
-        .edit(URI, 2, (0, 1), (0, 1), "#") // panics while reparsing
+        .edit(URI, 2, (0, 1), (0, 1), "#") // panics while reparsing, whole or not
         .open(other, "a # b") // panics while opening
-        .open(other, "fine")
-        .request("test/echo", json!(1))
+        .edit(other, 2, (0, 0), (0, 0), "x") // ignored: it never opened
+        .request("test/echo", json!(1));
+    // Whole-text changes recover both.
+    for (uri, text) in [(URI, "abcd"), (other, "fine")] {
+        client.notify(
+            "textDocument/didChange",
+            json!({ "textDocument": { "uri": uri, "version": 3 }, "contentChanges": [{ "text": text }] }),
+        );
+    }
+    client
+        .notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": other } }),
+        )
         .shutdown();
     let mut server = Server::new(Panicky, PanickyRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
-    assert_eq!(server.handler().changed, 2); // `abc`, then `fine`
-    assert_eq!(server.handler().closed, [URI]);
+    let changed: Vec<(&str, i32, &str)> = server
+        .handler()
+        .changed
+        .iter()
+        .map(|(u, v, t)| (u.as_str(), *v, t.as_str()))
+        .collect();
+    assert_eq!(
+        changed,
+        [(URI, 1, "abc"), (URI, 3, "abcd"), (other, 3, "fine")]
+    );
+    assert_eq!(server.handler().closed, [other]);
     let out = messages(&output);
     let logs = logs(&out);
-    assert_eq!(logs.len(), 2);
+    assert_eq!(logs.len(), 3);
     assert!(
-        logs.iter()
-            .all(|(kind, text)| *kind == 1 && text.contains("panicked"))
+        logs[0]
+            .1
+            .contains("the grammar panicked: the lexer cannot handle `#`")
     );
+    assert!(logs[1].1.contains("could not open") && logs[1].1.contains("panicked"));
+    assert!(logs[2].1.contains("could not be opened"));
     // The session carried on: requests are still answered.
     assert_eq!(
         error_code(&out, 2),
         Some(i64::from(ResponseError::METHOD_NOT_FOUND))
     );
+}
+
+/// The Lisp grammar with a bug in its fragment path: reparsing a single list
+/// on its own panics. Only incremental reparses take that path, so a full
+/// reparse of the same text succeeds.
+#[derive(Clone, Copy)]
+struct FragileLisp;
+
+impl Grammar for FragileLisp {
+    type Kind = <Lisp as Grammar>::Kind;
+    const ROOT: Self::Kind = Lisp::ROOT;
+    fn lex(&self, text: &str, tokens: &mut Vec<Token<Self::Kind>>) {
+        Lisp.lex(text, tokens);
+    }
+    fn parse(&self, kind: Self::Kind, b: &mut Builder<'_, Self::Kind>) {
+        assert!(kind == Self::ROOT, "fragment reparse is broken");
+        Lisp.parse(kind, b);
+    }
+    fn is_reparsable(&self, kind: Self::Kind) -> bool {
+        Lisp.is_reparsable(kind)
+    }
+}
+
+#[derive(Default)]
+struct FragileRecorder {
+    texts: Vec<String>,
+    full_parses: Vec<u64>,
+}
+
+impl Handler<FragileLisp> for FragileRecorder {
+    fn changed(&mut self, doc: &Document<FragileLisp>, _: &mut Context<'_, FragileLisp>) {
+        self.texts.push(doc.text().to_owned());
+        self.full_parses.push(doc.incremental().stats().full);
+    }
+}
+
+#[test]
+fn test_failed_incremental_reparse_falls_back_to_a_full_parse() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .open(URI, "(a)\n(b)")
+        .edit(URI, 2, (1, 1), (1, 2), "c") // inside a list: a fragment reparse
+        .edit(URI, 3, (0, 1), (0, 1), "x")
+        .shutdown();
+    let mut server = Server::new(FragileLisp, FragileRecorder::default());
+    let mut output = Vec::new();
+    assert!(server.run(client.bytes(), &mut output).is_ok());
+    assert_eq!(
+        server.handler().texts,
+        ["(a)\n(b)", "(a)\n(c)", "(xa)\n(c)"]
+    );
+    // Each edit was parsed whole, by a fresh document.
+    assert_eq!(server.handler().full_parses, [1, 1, 1]);
+    let out = messages(&output);
+    let logs = logs(&out);
+    assert_eq!(logs.len(), 2);
+    assert!(logs.iter().all(|(kind, text)| *kind == 2
+        && text.contains("fragment reparse is broken")
+        && text.contains("the whole text was parsed instead")));
 }
 
 // ---------------------------------------------------------------------------
@@ -1109,4 +1306,373 @@ fn test_answer_before_any_request_is_dropped() {
         [(0, Ok("\"on time\"".to_owned()))]
     );
     assert_eq!(logs(&out).len(), 1);
+}
+
+// ---------------------------------------------------------------------------
+// Handler panics, initialize ordering, and the bound on outstanding requests
+// ---------------------------------------------------------------------------
+
+/// A handler that panics in the entry points named in `panic_in`, and records
+/// every call that returned normally.
+#[derive(Default)]
+struct Bomb {
+    panic_in: Vec<&'static str>,
+    calls: Vec<String>,
+    /// Requests to send on `initialized`.
+    ask: usize,
+}
+
+impl Bomb {
+    fn armed(entry_points: &[&'static str]) -> Self {
+        Self {
+            panic_in: entry_points.to_vec(),
+            ..Self::default()
+        }
+    }
+
+    fn enter(&mut self, entry: &'static str, detail: &str) {
+        assert!(!self.panic_in.contains(&entry), "handler bug in {entry}");
+        self.calls.push(format!("{entry} {detail}"));
+    }
+}
+
+impl Handler<Lisp> for Bomb {
+    fn initialize(
+        &mut self,
+        _: Json<'_>,
+        cx: &mut Context<'_, Lisp>,
+    ) -> Result<Value, ResponseError> {
+        let starting = json!({ "type": 3, "message": "starting" });
+        assert!(cx.notify("window/logMessage", &starting).is_ok());
+        self.enter("initialize", "");
+        Ok(json!({ "hoverProvider": true }))
+    }
+
+    fn changed(&mut self, doc: &Document<Lisp>, _: &mut Context<'_, Lisp>) {
+        self.enter("changed", doc.text());
+    }
+
+    fn closed(&mut self, uri: &str, cx: &mut Context<'_, Lisp>) {
+        self.enter("closed", uri);
+        cx.clear_diagnostics(uri);
+    }
+
+    fn request(
+        &mut self,
+        method: &str,
+        _: Json<'_>,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<Reply, ResponseError> {
+        self.enter("request", method);
+        Ok(Reply::null())
+    }
+
+    fn notification(&mut self, method: &str, _: Json<'_>, cx: &mut Context<'_, Lisp>) {
+        if method == "initialized" {
+            for _ in 0..self.ask {
+                assert!(cx.request("workspace/configuration", &json!({})).is_ok());
+            }
+        }
+        self.enter("notification", method);
+    }
+
+    fn response(
+        &mut self,
+        id: u64,
+        result: Result<Json<'_>, ResponseError>,
+        _: &mut Context<'_, Lisp>,
+    ) {
+        let detail = match result {
+            Ok(json) => format!("{id} ok {}", json.as_str()),
+            Err(e) => format!("{id} err {}", e.code()),
+        };
+        self.enter("response", &detail);
+    }
+}
+
+/// A session that reaches every entry point once after `initialize` (with one
+/// server request answered as id 0), then proves the session is alive with a
+/// final request, id 3.
+fn every_entry_point(client: &mut Client) {
+    client
+        .initialize(&[])
+        .open(URI, "(a)")
+        .edit(URI, 2, (0, 1), (0, 2), "b")
+        .request("custom/ask", json!({}))
+        .notify("custom/tell", json!({}));
+    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": "answer" }));
+    client
+        .notify(
+            "textDocument/didClose",
+            json!({ "textDocument": { "uri": URI } }),
+        )
+        .request("custom/alive", json!({}))
+        .shutdown();
+}
+
+#[test]
+fn test_handler_panic_in_request_answers_internal_error_and_session_lives() {
+    let mut client = Client::new();
+    every_entry_point(&mut client);
+    let mut bomb = Bomb::armed(&["request"]);
+    bomb.ask = 1;
+    let (server, result, out) = run(bomb, &client);
+    assert!(result.is_ok());
+    for id in [2, 3] {
+        assert_eq!(
+            error_code(&out, id),
+            Some(i64::from(ResponseError::INTERNAL_ERROR))
+        );
+        let message = response(&out, id)["error"]["message"]
+            .as_str()
+            .unwrap_or("");
+        assert!(message.contains("panicked") && message.contains("handler bug in request"));
+    }
+    // Every other entry point still ran.
+    let calls = &server.handler().calls;
+    assert!(calls.iter().any(|c| c == "changed (b)"));
+    assert!(calls.iter().any(|c| c == "closed file:///t.lisp"));
+    assert!(calls.iter().any(|c| c == "response 0 ok \"answer\""));
+}
+
+#[test]
+fn test_handler_panic_in_each_notification_entry_point_is_logged() {
+    for entry in ["changed", "closed", "notification", "response"] {
+        let mut client = Client::new();
+        every_entry_point(&mut client);
+        let mut bomb = Bomb::armed(&[entry]);
+        bomb.ask = 1;
+        let (server, result, out) = run(bomb, &client);
+        assert!(result.is_ok(), "{entry}: the session ended");
+        // The session is alive to the end: the last request is answered.
+        let last = response(&out, 3);
+        assert!(
+            last.get("result").is_some() && last.get("error").is_none(),
+            "{entry}: the final request was not answered"
+        );
+        let errors: Vec<String> = logs(&out)
+            .into_iter()
+            .filter(|(kind, _)| *kind == 1)
+            .map(|(_, text)| text)
+            .collect();
+        let expected = format!("handler bug in {entry}");
+        assert!(!errors.is_empty(), "{entry}: nothing logged");
+        assert!(
+            errors
+                .iter()
+                .all(|e| e.contains("the handler panicked") && e.contains(&expected)),
+            "{entry}: {errors:?}"
+        );
+        let calls = &server.handler().calls;
+        assert!(!calls.iter().any(|c| c.starts_with(entry)), "{entry}");
+        // The rest of the session's entry points ran normally.
+        assert!(calls.iter().any(|c| c == "request custom/alive"), "{entry}");
+    }
+}
+
+#[test]
+fn test_handler_panic_in_changed_keeps_the_document() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .open(URI, "(a)")
+        .edit(URI, 2, (0, 1), (0, 2), "b")
+        .at("textDocument/hover", URI, 0, 1)
+        .shutdown();
+    // The Lisp server answers hover from the document; a panicking `changed`
+    // before it must not have dropped it.
+    struct PanicsOnChange(LispServer);
+    impl Handler<Lisp> for PanicsOnChange {
+        fn changed(&mut self, doc: &Document<Lisp>, cx: &mut Context<'_, Lisp>) {
+            self.0.changed(doc, cx);
+            assert!(doc.version() < 2, "handler bug in changed");
+        }
+        fn request(
+            &mut self,
+            method: &str,
+            params: Json<'_>,
+            cx: &mut Context<'_, Lisp>,
+        ) -> Result<Reply, ResponseError> {
+            self.0.request(method, params, cx)
+        }
+    }
+    let (_, result, out) = run(PanicsOnChange(LispServer::default()), &client);
+    assert!(result.is_ok());
+    assert_eq!(
+        response(&out, 2)["result"]["contents"]["value"],
+        "`b`: not defined"
+    );
+}
+
+#[test]
+fn test_handler_panic_in_initialize_refuses_it_and_discards_what_it_sent() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .request("custom/early", json!({}))
+        .shutdown();
+    let (_, result, out) = run(Bomb::armed(&["initialize"]), &client);
+    assert_eq!(
+        error_code(&out, 1),
+        Some(i64::from(ResponseError::INTERNAL_ERROR))
+    );
+    assert!(
+        response(&out, 1)["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("handler bug in initialize"))
+    );
+    // Still uninitialized, and the handler's "starting" was never written.
+    assert_eq!(
+        error_code(&out, 2),
+        Some(i64::from(ResponseError::SERVER_NOT_INITIALIZED))
+    );
+    assert!(logs(&out).is_empty());
+    assert!(matches!(result, Err(Error::ExitWithoutShutdown)));
+}
+
+/// Sends a notification and a request from `initialize`.
+struct EagerInit {
+    fail: bool,
+    responses: Vec<u64>,
+}
+
+impl Handler<Lisp> for EagerInit {
+    fn initialize(
+        &mut self,
+        _: Json<'_>,
+        cx: &mut Context<'_, Lisp>,
+    ) -> Result<Value, ResponseError> {
+        let message = json!({ "type": 3, "message": "hi" });
+        assert!(cx.notify("window/showMessage", &message).is_ok());
+        assert!(cx.request("window/showMessageRequest", &message).is_ok());
+        if self.fail {
+            return Err(ResponseError::new(ResponseError::REQUEST_FAILED, "no"));
+        }
+        Ok(json!({}))
+    }
+
+    fn response(&mut self, id: u64, _: Result<Json<'_>, ResponseError>, _: &mut Context<'_, Lisp>) {
+        self.responses.push(id);
+    }
+}
+
+#[test]
+fn test_initialize_result_goes_out_before_anything_the_handler_sent() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": null }));
+    client.shutdown();
+    let handler = EagerInit {
+        fail: false,
+        responses: Vec::new(),
+    };
+    let (server, result, out) = run(handler, &client);
+    assert!(result.is_ok());
+    let order: Vec<String> = out
+        .iter()
+        .map(|m| match m["method"].as_str() {
+            Some(method) => method.to_owned(),
+            None => format!("response {}", m["id"]),
+        })
+        .collect();
+    assert_eq!(
+        order[..3],
+        [
+            "response 1",
+            "window/showMessage",
+            "window/showMessageRequest"
+        ]
+    );
+    // The request sent during `initialize` is outstanding and gets its answer.
+    assert_eq!(server.handler().responses, [0]);
+}
+
+#[test]
+fn test_failed_initialize_sends_nothing_from_the_handler_and_forgets_its_requests() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    // An answer to the request the failed `initialize` never sent.
+    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": null }));
+    client.notify("exit", Value::Null);
+    let handler = EagerInit {
+        fail: true,
+        responses: Vec::new(),
+    };
+    let (server, _, out) = run(handler, &client);
+    assert_eq!(
+        error_code(&out, 1),
+        Some(i64::from(ResponseError::REQUEST_FAILED))
+    );
+    assert!(
+        out.iter()
+            .all(|m| m["method"] != "window/showMessage"
+                && m["method"] != "window/showMessageRequest")
+    );
+    assert!(server.handler().responses.is_empty());
+    assert_eq!(logs(&out).len(), 1); // the stray answer
+}
+
+#[test]
+fn test_outstanding_requests_are_capped_by_cancelling_the_oldest() {
+    const CAP: u64 = 1024;
+    let bomb = Bomb {
+        ask: CAP as usize + 3,
+        ..Bomb::default()
+    };
+    let mut client = Client::new();
+    client.initialize(&[]);
+    // An answer to a cancelled request is dropped; the newest still lands.
+    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": "late" }));
+    client.send(&json!({ "jsonrpc": "2.0", "id": CAP + 2, "result": "on time" }));
+    client.shutdown();
+    let (server, result, out) = run(bomb, &client);
+    assert!(result.is_ok());
+    let sent = out
+        .iter()
+        .filter(|m| m["method"] == "workspace/configuration")
+        .count();
+    assert_eq!(sent, CAP as usize + 3);
+    let cancels: Vec<&Value> = out
+        .iter()
+        .filter(|m| m["method"] == "$/cancelRequest")
+        .map(|m| &m["params"]["id"])
+        .collect();
+    assert_eq!(cancels, [&json!(0), &json!(1), &json!(2)]);
+    let responses: Vec<&str> = server
+        .handler()
+        .calls
+        .iter()
+        .filter_map(|c| c.strip_prefix("response "))
+        .collect();
+    let cancelled = ResponseError::REQUEST_CANCELLED;
+    let expected = [
+        format!("0 err {cancelled}"),
+        format!("1 err {cancelled}"),
+        format!("2 err {cancelled}"),
+        format!("{} ok \"on time\"", CAP + 2),
+    ];
+    assert_eq!(responses, expected);
+    // Besides the handler's own "starting", only the late answer is logged.
+    let warnings: Vec<(i64, String)> = logs(&out).into_iter().filter(|l| l.0 == 2).collect();
+    assert_eq!(warnings.len(), 1);
+    assert!(warnings[0].1.contains("id 0"));
+}
+
+#[test]
+fn test_malformed_request_with_a_valid_id_is_answered_under_that_id() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    client.send_raw(r#"{"jsonrpc":"2.0","id":7,"method":42}"#);
+    client.send_raw(r#"{"jsonrpc":"2.0","id":"s-1","method":{"a":1}}"#);
+    client.send_raw(r#"{"jsonrpc":"2.0","id":7.5,"method":42}"#);
+    client.request("test/echo", json!("alive")).shutdown();
+    let (_, result, out) = run(recorder(), &client);
+    assert!(result.is_ok());
+    let invalid: Vec<&Value> = out
+        .iter()
+        .filter(|m| m["error"]["code"] == ResponseError::INVALID_REQUEST)
+        .map(|m| &m["id"])
+        .collect();
+    assert_eq!(invalid, [&json!(7), &json!("s-1"), &Value::Null]);
+    assert_eq!(response(&out, 2)["result"], "alive");
 }

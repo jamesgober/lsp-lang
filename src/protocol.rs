@@ -36,6 +36,41 @@ pub(crate) struct Envelope<'a> {
     pub(crate) error: Option<&'a RawValue>,
 }
 
+/// What is still worth reading from a message whose [`Envelope`] did not
+/// parse — a `method` that is not a string, say. Every member is kept raw, so
+/// this parses any JSON object without duplicate `id` or `method` members.
+///
+/// With a `method` the message was meant as a request, and if its `id` is
+/// valid the error response goes under that id, so the client can match it to
+/// the request. Without one it may be a broken answer to one of the server's
+/// own requests, which must never be answered under its id.
+#[derive(Deserialize)]
+pub(crate) struct Salvage<'a> {
+    #[serde(default, borrow, deserialize_with = "present")]
+    pub(crate) id: Option<&'a RawValue>,
+    #[serde(default, borrow, deserialize_with = "present")]
+    pub(crate) method: Option<&'a RawValue>,
+}
+
+impl<'a> Salvage<'a> {
+    /// The id to answer an unreadable message `body` under: its own if it was
+    /// a request with a valid id, otherwise `null`.
+    pub(crate) fn reply_id(body: &'a [u8]) -> &'a str {
+        // A derived struct also reads from an array (`[5, "m"]` would be
+        // id 5, method "m"), and a batch is not a request with an id.
+        if body.trim_ascii_start().first() != Some(&b'{') {
+            return "null";
+        }
+        serde_json::from_slice::<Salvage<'a>>(body)
+            .ok()
+            .filter(|message| message.method.is_some())
+            .and_then(|message| message.id)
+            .map(RawValue::get)
+            .filter(|id| is_valid_id(id))
+            .unwrap_or("null")
+    }
+}
+
 /// Deserializes a member that is present, whatever its value, as `Some`.
 fn present<'de, 'a, D>(deserializer: D) -> Result<Option<&'a RawValue>, D::Error>
 where
@@ -195,6 +230,28 @@ mod tests {
         assert!(msg.is_some_and(|m| m.error.is_some()));
         let wire: Option<WireError<'_>> = serde_json::from_str(r#"{"code":-32601}"#).ok();
         assert!(wire.is_some_and(|w| w.code == Some(-32601) && w.message.is_empty()));
+    }
+
+    #[test]
+    fn test_salvage_answers_a_broken_request_under_its_own_id() {
+        let reply_id = |body: &str| Salvage::reply_id(body.as_bytes()).to_owned();
+        // A request whose envelope does not parse keeps its id.
+        assert_eq!(reply_id(r#"{"id":5,"method":42}"#), "5");
+        assert_eq!(reply_id(r#"{"id":"a-1","method":["m"]}"#), "\"a-1\"");
+        // An id the protocol does not allow is never echoed.
+        assert_eq!(reply_id(r#"{"id":1.5,"method":42}"#), "null");
+        assert_eq!(reply_id(r#"{"id":null,"method":42}"#), "null");
+        // Without a method it may be an answer: never reply under its id.
+        assert_eq!(reply_id(r#"{"id":5,"result":1,"result":2}"#), "null");
+        // Not an object, not JSON, or an ambiguous id: `null`.
+        assert_eq!(reply_id("[1,2]"), "null");
+        assert_eq!(reply_id(r#" [5, "m"]"#), "null");
+        assert_eq!(
+            reply_id(r#"  {"id":7,"method":null,"params":1,"params":2}"#),
+            "7"
+        );
+        assert_eq!(reply_id(r#"{"id":5,"method":"#), "null");
+        assert_eq!(reply_id(r#"{"id":5,"id":6,"method":"m"}"#), "null");
     }
 
     #[test]

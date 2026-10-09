@@ -212,6 +212,33 @@ impl Outbox {
         });
     }
 
+    /// Sends `$/cancelRequest` for the server's own request `id`.
+    pub(crate) fn cancel(&mut self, id: u64) {
+        self.notify_with("$/cancelRequest", |out| {
+            out.extend_from_slice(b"{\"id\":");
+            write_u64(out, id);
+            out.push(b'}');
+        });
+    }
+
+    /// Where the next message will start, to hold back what follows with
+    /// [`hold_from`](Outbox::hold_from).
+    pub(crate) fn mark(&self) -> usize {
+        self.out.len()
+    }
+
+    /// Removes and returns the framed messages queued since `mark`, so they
+    /// can be sent later with [`release`](Outbox::release) — after the
+    /// `initialize` response, which the protocol requires to come first.
+    pub(crate) fn hold_from(&mut self, mark: usize) -> Vec<u8> {
+        self.out.split_off(mark.min(self.out.len()))
+    }
+
+    /// Queues messages previously taken with [`hold_from`](Outbox::hold_from).
+    pub(crate) fn release(&mut self, held: &[u8]) {
+        self.out.extend_from_slice(held);
+    }
+
     /// Writes all pending messages to `output` and flushes it. Does nothing
     /// when there is nothing to send.
     pub(crate) fn flush<W: Write>(&mut self, output: &mut W) -> Result<(), Error> {

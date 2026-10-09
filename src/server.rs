@@ -2,6 +2,8 @@
 //! documents in sync, and calls the [`Handler`] for the rest.
 
 use std::{
+    any::Any,
+    collections::BTreeSet,
     fmt,
     io::{BufRead, Write},
     panic::{self, AssertUnwindSafe},
@@ -12,13 +14,16 @@ use serde::Serialize;
 use serde_json::{Map, Value, value::RawValue};
 
 use crate::{
-    context::{Context, Wire, Workspace},
+    context::{Context, MAX_PENDING_REQUESTS, Wire, Workspace},
     document::Document,
     error::Error,
     handler::Handler,
     json::{Json, Reply, ResponseError},
     position::Encoding,
-    protocol::{DidChange, DidClose, DidOpen, Envelope, InitializeParams, WireError, is_valid_id},
+    protocol::{
+        ContentChange, DidChange, DidClose, DidOpen, Envelope, InitializeParams, Salvage,
+        WireError, is_valid_id,
+    },
     transport::read_message,
 };
 
@@ -46,10 +51,16 @@ const LOG_WARNING: u8 = 2;
 /// - **Document sync.** `didOpen`, `didChange` (incremental or whole-text),
 ///   and `didClose` maintain a [`Document`] per open file, each incrementally
 ///   reparsed with the grammar `G`, and the handler hears about each change
-///   through [`Handler::changed`].
+///   through [`Handler::changed`]. A change that cannot be applied never
+///   loses the document: it keeps its last good state, marked out of step,
+///   until a whole-text change or a reopen brings it back (see
+///   [`Handler::changed`]).
 /// - **Errors.** Malformed JSON and invalid messages are answered with the
-///   JSON-RPC error codes; problems with notifications, which cannot be
-///   answered, are reported to the client with `window/logMessage`.
+///   JSON-RPC error codes (under the request's own id whenever it can be
+///   read); problems with notifications, which cannot be answered, are
+///   reported to the client with `window/logMessage`. A panic in the grammar
+///   or the handler is contained where panics unwind: it costs one request
+///   (answered with `InternalError`) or is logged, never the session.
 ///
 /// The server is synchronous and single-threaded: it handles one message at a
 /// time and writes everything the handler sent, with a single write and
@@ -250,6 +261,10 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
     /// Each call is a fresh session — uninitialized, with no documents open —
     /// while the grammar and handler carry over.
     ///
+    /// Nothing the client sends and no panic in the grammar or handler ends
+    /// the session (where panics unwind); only the transport and the
+    /// lifecycle do, as listed below.
+    ///
     /// # Errors
     ///
     /// `Ok(())` means a clean stop: `shutdown`, then `exit`. Otherwise:
@@ -319,6 +334,7 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
                 return Err(Error::Disconnected);
             }
             let exit = self.dispatch(&body, &mut session);
+            self.deliver_cancelled(&mut session);
             session.wire.outbox.flush(&mut output)?;
             if exit {
                 return if session.phase == Phase::ShuttingDown {
@@ -343,7 +359,9 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
                     ResponseError::PARSE_ERROR
                 };
                 let error = ResponseError::new(code, format!("unreadable message: {e}"));
-                s.wire.outbox.respond("null", Err(&error));
+                // A request that is readable enough to have a valid id is
+                // answered under it, so the client can match the error to it.
+                s.wire.outbox.respond(Salvage::reply_id(body), Err(&error));
                 return false;
             }
         };
@@ -391,7 +409,7 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
 
     fn request(&mut self, method: &str, id: &str, params: Json<'_>, s: &mut Session<G>) {
         let result = match (s.phase, method) {
-            (Phase::Uninitialized, "initialize") => self.initialize(params, s),
+            (Phase::Uninitialized, "initialize") => return self.initialize(id, params, s),
             (Phase::Uninitialized, _) => Err(ResponseError::new(
                 ResponseError::SERVER_NOT_INITIALIZED,
                 format!("`{method}` received before `initialize`"),
@@ -404,26 +422,52 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
                 s.phase = Phase::ShuttingDown;
                 Ok(Reply::null())
             }
-            (Phase::Running, _) => self.handler.request(method, params, &mut s.context()),
+            (Phase::Running, _) => {
+                let handler = &mut self.handler;
+                let mut cx = s.context();
+                caught(|| handler.request(method, params, &mut cx))
+                    .unwrap_or_else(|why| Err(handler_panicked(method, &why)))
+            }
             (Phase::ShuttingDown, _) => Err(ResponseError::new(
                 ResponseError::INVALID_REQUEST,
                 format!("`{method}` received after `shutdown`"),
             )),
         };
-        match &result {
-            Ok(reply) => s.wire.outbox.respond(id, Ok(reply.as_str())),
-            Err(error) => s.wire.outbox.respond(id, Err(error)),
+        s.respond(id, &result);
+    }
+
+    /// Answers `initialize`. Everything the handler sends while it runs is
+    /// held back and sent after the response: until the server has answered
+    /// with its capabilities the client may not be ready for anything else,
+    /// and the response coming first is the one order that is always safe.
+    ///
+    /// If `initialize` fails, the session stays uninitialized and what the
+    /// handler sent is discarded, never written; any requests among it are
+    /// forgotten, since nothing will answer them.
+    fn initialize(&mut self, id: &str, params: Json<'_>, s: &mut Session<G>) {
+        let mark = s.wire.outbox.mark();
+        let result = self.negotiate(params, s);
+        let held = s.wire.outbox.hold_from(mark);
+        s.respond(id, &result);
+        if result.is_ok() {
+            s.wire.outbox.release(&held);
+        } else {
+            s.wire.requests.forget();
         }
     }
 
     /// Negotiates the encoding, asks the handler for its capabilities, and
     /// adds the server's own.
-    fn initialize(&mut self, params: Json<'_>, s: &mut Session<G>) -> Result<Reply, ResponseError> {
+    fn negotiate(&mut self, params: Json<'_>, s: &mut Session<G>) -> Result<Reply, ResponseError> {
         let client = params
             .parse::<Option<InitializeParams<'_>>>()?
             .unwrap_or_default();
         let encoding = Encoding::negotiate(client.position_encodings());
-        let mut capabilities = match self.handler.initialize(params, &mut s.context())? {
+        let handler = &mut self.handler;
+        let mut cx = s.context();
+        let answer = caught(|| handler.initialize(params, &mut cx))
+            .unwrap_or_else(|why| Err(handler_panicked("initialize", &why)));
+        let mut capabilities = match answer? {
             Value::Object(map) => map,
             _ => Map::new(),
         };
@@ -462,7 +506,11 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
             "textDocument/didOpen" => self.did_open(params, s),
             "textDocument/didChange" => self.did_change(params, s),
             "textDocument/didClose" => self.did_close(params, s),
-            _ => self.handler.notification(method, params, &mut s.context()),
+            _ => self.contained(
+                s,
+                || format!("`{method}`"),
+                |handler, cx| handler.notification(method, params, cx),
+            ),
         }
         false
     }
@@ -477,17 +525,28 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
         let (version, text, encoding) = (opened.version, opened.text, s.encoding);
         match guarded(|| Document::open(grammar, &uri, version, text, encoding)) {
             Ok(document) => {
+                let _was_unopened = s.unopened.remove(&uri);
                 let _replaced = s.workspace.insert(uri.clone(), document);
                 self.changed(&uri, s);
             }
             Err(why) => {
-                // A document already open under this URI no longer matches
-                // the client's text either: drop it too.
-                let message = format!("could not open `{uri}`: {why}");
+                // Keep what there is: a document already open under this URI
+                // stays, at its last good state, marked out of step; a new one
+                // is remembered so a whole-text change can still open it.
+                let message = match s.workspace.get_mut(&uri) {
+                    Some(document) => {
+                        document.mark_stale();
+                        format!(
+                            "could not reopen `{uri}`: {why}; keeping version {} until {RESYNC}",
+                            document.version()
+                        )
+                    }
+                    None => {
+                        let _fresh = s.unopened.insert(uri.clone());
+                        format!("could not open `{uri}`: {why}; it stays closed until {RESYNC}")
+                    }
+                };
                 s.wire.outbox.log(LOG_ERROR, &message);
-                if s.workspace.remove(&uri).is_some() {
-                    self.handler.closed(&uri, &mut s.context());
-                }
             }
         }
     }
@@ -498,29 +557,106 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
             Err(e) => return s.ignored("textDocument/didChange", e.message()),
         };
         let uri = &*change.text_document.uri;
+        let version = change.text_document.version;
+        let edits = &change.content_changes[..];
+        // A whole-text change supersedes every edit before it and applies
+        // whatever state this copy is in: it is how a document out of step
+        // with the client gets back in step.
+        let mut from = edits.iter().rposition(|edit| edit.range.is_none());
+        if !s.workspace.contains_key(uri) {
+            if !self.open_from_change(uri, version, edits, from, s) {
+                return;
+            }
+            // Opened from the whole-text change; the edits after it remain.
+            from = from.map(|at| at + 1);
+        }
         let Some(document) = s.workspace.get_mut(uri) else {
-            let message = format!("ignored a change to `{uri}`, which is not open");
-            return s.wire.outbox.log(LOG_WARNING, &message);
+            return;
         };
-        let edits = &change.content_changes;
-        let applied = guarded(|| {
-            edits
-                .iter()
-                .try_for_each(|edit| document.change(edit.range, &edit.text))
-        });
-        match applied {
-            Ok(()) => {
-                document.set_version(change.text_document.version);
+        let edits = match from {
+            Some(at) => edits.get(at..).unwrap_or_default(),
+            None if document.is_stale() => {
+                let message = format!(
+                    "ignored a change to `{uri}`, which is out of step; waiting for {RESYNC}"
+                );
+                return s.wire.outbox.log(LOG_WARNING, &message);
+            }
+            None if version <= document.version() => {
+                // Versions only increase. A repeat or an older version means
+                // this change was already applied, or others went missing.
+                document.mark_stale();
+                let message = format!(
+                    "`{uri}` is out of step: a change to version {version} arrived after version {}; \
+                     keeping version {} until {RESYNC}",
+                    document.version(),
+                    document.version()
+                );
+                return s.wire.outbox.log(LOG_WARNING, &message);
+            }
+            None => edits,
+        };
+        match apply(document, edits) {
+            Ok(recovered) => {
+                document.synced(version);
+                if let Some(fault) = recovered {
+                    // In step, but the grammar has a bug worth knowing about.
+                    let message = format!(
+                        "reparsing an edit to `{uri}` incrementally failed ({fault});                          the whole text was parsed instead"
+                    );
+                    s.wire.outbox.log(LOG_WARNING, &message);
+                }
                 self.changed(uri, s);
             }
+            Err(failure) => {
+                document.mark_stale();
+                let message = format!(
+                    "`{uri}` is out of step: {failure}; keeping version {} until {RESYNC}",
+                    document.version()
+                );
+                s.wire.outbox.log(failure.level(), &message);
+            }
+        }
+    }
+
+    /// Handles a change to a document that is not open. If its `didOpen`
+    /// failed and the change carries a whole text (at `whole`), the document
+    /// is opened from that text, and `true` returned; otherwise the change is
+    /// logged and ignored.
+    fn open_from_change(
+        &mut self,
+        uri: &str,
+        version: i32,
+        edits: &[ContentChange<'_>],
+        whole: Option<usize>,
+        s: &mut Session<G>,
+    ) -> bool {
+        let failed_open = s.unopened.contains(uri);
+        let text = whole
+            .filter(|_| failed_open)
+            .and_then(|at| edits.get(at))
+            .map(|edit| edit.text.to_string());
+        let Some(text) = text else {
+            let message = if failed_open {
+                format!(
+                    "ignored a change to `{uri}`, which could not be opened; waiting for {RESYNC}"
+                )
+            } else {
+                format!("ignored a change to `{uri}`, which is not open")
+            };
+            s.wire.outbox.log(LOG_WARNING, &message);
+            return false;
+        };
+        let (grammar, encoding) = (self.grammar.clone(), s.encoding);
+        match guarded(|| Document::open(grammar, uri, version, text, encoding)) {
+            Ok(document) => {
+                let _was_unopened = s.unopened.remove(uri);
+                let _fresh = s.workspace.insert(uri.into(), document);
+                true
+            }
             Err(why) => {
-                // The document no longer matches the client's text, and the
-                // edit cannot be retried. Drop it rather than serve stale
-                // positions; the client reopens it on its next open.
-                let _dropped = s.workspace.remove(uri);
-                let message = format!("closed `{uri}`: an edit could not be applied: {why}");
+                let message = format!("could not open `{uri}` from a whole-text change: {why}");
                 s.wire.outbox.log(LOG_ERROR, &message);
-                self.handler.closed(uri, &mut s.context());
+                false
             }
         }
     }
@@ -530,8 +666,14 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
             Ok(p) => p.text_document,
             Err(e) => return s.ignored("textDocument/didClose", e.message()),
         };
-        if s.workspace.remove(&*closed.uri).is_some() {
-            self.handler.closed(&closed.uri, &mut s.context());
+        let uri = &*closed.uri;
+        let _was_unopened = s.unopened.remove(uri);
+        if s.workspace.remove(uri).is_some() {
+            self.contained(
+                s,
+                || format!("`textDocument/didClose` for `{uri}`"),
+                |handler, cx| handler.closed(uri, cx),
+            );
         }
     }
 
@@ -540,9 +682,54 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
         let Session {
             workspace, wire, ..
         } = s;
-        if let Some(document) = workspace.get(uri) {
-            let mut cx = Context::new(workspace, wire);
-            self.handler.changed(document, &mut cx);
+        let Some(document) = workspace.get(uri) else {
+            return;
+        };
+        let handler = &mut self.handler;
+        let mut cx = Context::new(workspace, wire);
+        if let Err(why) = caught(|| handler.changed(document, &mut cx)) {
+            let message = format!("the handler panicked in a change to `{uri}`: {why}");
+            wire.outbox.log(LOG_ERROR, &message);
+        }
+    }
+
+    /// Calls a handler method that has no result. A panic in it is contained:
+    /// it is logged to the client as having happened during `during()`, and
+    /// the session carries on.
+    fn contained(
+        &mut self,
+        s: &mut Session<G>,
+        during: impl FnOnce() -> String,
+        call: impl FnOnce(&mut H, &mut Context<'_, G>),
+    ) {
+        let handler = &mut self.handler;
+        let mut cx = s.context();
+        if let Err(why) = caught(|| call(handler, &mut cx)) {
+            let message = format!("the handler panicked in {}: {why}", during());
+            s.wire.outbox.log(LOG_ERROR, &message);
+        }
+    }
+
+    /// Delivers [`REQUEST_CANCELLED`](ResponseError::REQUEST_CANCELLED) for
+    /// each of the server's requests cancelled to stay under the cap on
+    /// outstanding requests. Requests a handler sends while hearing of these
+    /// cancellations wait for the next message, so a handler that answers
+    /// every cancellation with a new request cannot keep this loop going.
+    fn deliver_cancelled(&mut self, s: &mut Session<G>) {
+        let cancelled = s.wire.requests.take_cancelled();
+        for id in cancelled {
+            let error = ResponseError::new(
+                ResponseError::REQUEST_CANCELLED,
+                format!(
+                    "cancelled without an answer: more than {MAX_PENDING_REQUESTS} requests \
+                     were outstanding, and this was the oldest"
+                ),
+            );
+            self.contained(
+                s,
+                || format!("the cancellation of request {id}"),
+                |handler, cx| handler.response(id, Err(error), cx),
+            );
         }
     }
 
@@ -572,7 +759,125 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
                 "the client's response had neither `result` nor `error`",
             )),
         };
-        self.handler.response(id, result, &mut s.context());
+        self.contained(
+            s,
+            || format!("the answer to request {id}"),
+            |handler, cx| handler.response(id, result, cx),
+        );
+    }
+}
+
+/// How a document out of step with the client is recovered, for log messages.
+const RESYNC: &str = "a whole-text change or a reopen";
+
+/// Applies a `didChange`'s edits, in order, to `document`.
+///
+/// Each edit is placed (see [`Document::edit_span`]) and reparsed
+/// incrementally. If the incremental reparse fails — the grammar panicked or
+/// broke its contract on the fragment — the same edit is applied again by
+/// splicing the text and parsing it whole, which a grammar fault confined to
+/// the fragment path survives.
+///
+/// All or nothing: if any edit fails, the document is put back to the text it
+/// had before the first, its last state the client also had. Only a change of
+/// several edits needs that, so only then is the starting text kept.
+///
+/// On success, returns the first incremental fault that a full reparse
+/// recovered from, if any, so the grammar bug behind it can be reported.
+fn apply<G: Grammar + Clone>(
+    document: &mut Document<G>,
+    edits: &[ContentChange<'_>],
+) -> Result<Option<Fault>, Failure> {
+    let saved = (edits.len() > 1).then(|| document.text().to_owned());
+    let mut recovered = None;
+    for (at, edit) in edits.iter().enumerate() {
+        match apply_one(document, edit) {
+            Ok(fault) => recovered = recovered.or(fault),
+            Err(failure) => {
+                if let Some(saved) = saved.filter(|_| at > 0) {
+                    // The saved text parsed before; if the grammar now fails
+                    // on it, the document keeps the edits applied so far. It
+                    // is marked out of step either way.
+                    let _restored = guarded(|| document.reset(saved));
+                }
+                return Err(failure);
+            }
+        }
+    }
+    Ok(recovered)
+}
+
+/// Applies one edit: incrementally, or by full reparse if that fails, in
+/// which case the incremental fault is returned.
+fn apply_one<G: Grammar + Clone>(
+    document: &mut Document<G>,
+    edit: &ContentChange<'_>,
+) -> Result<Option<Fault>, Failure> {
+    let span = document.edit_span(edit.range).ok_or(Failure::Misplaced)?;
+    let text = &*edit.text;
+    match guarded(|| document.edit(span, text)) {
+        Ok(()) => Ok(None),
+        Err(Fault::Edit(
+            error @ (incremental_lang::Error::TooLarge { .. }
+            | incremental_lang::Error::OutOfBounds { .. }
+            | incremental_lang::Error::NotCharBoundary { .. }),
+        )) => Err(Failure::Refused(error)),
+        Err(fault) => match guarded(|| document.rebuild(span, text)) {
+            Ok(()) => Ok(Some(fault)),
+            Err(fault) => Err(Failure::Unparsable(fault)),
+        },
+    }
+}
+
+/// Why a `didChange` could not be applied.
+enum Failure {
+    /// An edit's range names a line the document does not have.
+    Misplaced,
+    /// The edit was refused before any parsing: the text would outgrow 4 GiB.
+    Refused(incremental_lang::Error),
+    /// The grammar failed on the new text, incrementally and from scratch.
+    Unparsable(Fault),
+}
+
+impl Failure {
+    /// The `window/logMessage` level: the client's text drifting from the
+    /// server's copy is a warning; the grammar failing on it is a bug, an
+    /// error.
+    fn level(&self) -> u8 {
+        match self {
+            Failure::Misplaced | Failure::Refused(_) => LOG_WARNING,
+            Failure::Unparsable(_) => LOG_ERROR,
+        }
+    }
+}
+
+impl fmt::Display for Failure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Failure::Misplaced => {
+                f.write_str("an edit's range names a line the document does not have")
+            }
+            Failure::Refused(error) => write!(f, "an edit could not be applied: {error}"),
+            Failure::Unparsable(fault) => write!(f, "an edit could not be parsed: {fault}"),
+        }
+    }
+}
+
+/// What went wrong in grammar code run under [`guarded`].
+#[derive(Debug, PartialEq, Eq)]
+enum Fault {
+    /// `incremental-lang` refused the work.
+    Edit(incremental_lang::Error),
+    /// The grammar panicked; the panic's message, if it had one.
+    Panic(String),
+}
+
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Fault::Edit(error) => error.fmt(f),
+            Fault::Panic(why) => write!(f, "the grammar panicked: {why}"),
+        }
     }
 }
 
@@ -595,28 +900,72 @@ fn client_error(raw: &RawValue) -> ResponseError {
     }
 }
 
-/// Runs grammar code (opening or editing a document), turning a panic into an
-/// error so one faulty grammar costs one document, not the session.
+/// Runs grammar code (opening or editing a document), turning a panic into a
+/// [`Fault`], so a faulty grammar costs at most one document's freshness,
+/// never the session.
 ///
 /// `incremental-lang` leaves a document untouched when a grammar panic is
-/// caught, but the server drops the document either way, so nothing observes
-/// a half-finished state. (In a binary built with `panic = "abort"` there is
-/// nothing to catch, and the process ends as that setting asks.)
-fn guarded<T>(work: impl FnOnce() -> Result<T, incremental_lang::Error>) -> Result<T, String> {
-    match panic::catch_unwind(AssertUnwindSafe(work)) {
+/// caught, and so do [`Document::rebuild`] and [`Document::reset`], so
+/// nothing observes a half-finished state. (In a binary built with
+/// `panic = "abort"` there is nothing to catch, and the process ends as that
+/// setting asks.)
+fn guarded<T>(work: impl FnOnce() -> Result<T, incremental_lang::Error>) -> Result<T, Fault> {
+    match caught(work) {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(error.to_string()),
-        Err(_) => Err("the grammar panicked".to_owned()),
+        Ok(Err(error)) => Err(Fault::Edit(error)),
+        Err(why) => Err(Fault::Panic(why)),
     }
+}
+
+/// Runs `work`, turning a panic into its message.
+///
+/// Used for every call into code the server does not own — the grammar and
+/// the handler — so a bug there costs one request, notification, or document,
+/// not the session. The server's own state stays consistent across a caught
+/// panic: the handler sees the workspace only through a shared reference, and
+/// the outgoing-message buffer and the request bookkeeping commit each message
+/// whole. The handler's own state is whatever its panic left.
+fn caught<T>(work: impl FnOnce() -> T) -> Result<T, String> {
+    panic::catch_unwind(AssertUnwindSafe(work)).map_err(|payload| panic_message(&*payload))
+}
+
+/// A panic payload as text: the message of `panic!` and friends, clipped, or
+/// a placeholder for any other payload.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    let text = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str));
+    match text {
+        Some(text) => clip_to(text, MAX_PANIC_MESSAGE),
+        None => "(a panic without a message)".to_owned(),
+    }
+}
+
+/// Longest panic message quoted to the client, in bytes.
+const MAX_PANIC_MESSAGE: usize = 256;
+
+/// The `INTERNAL_ERROR` a request is answered with when its handler panicked.
+fn handler_panicked(method: &str, why: &str) -> ResponseError {
+    ResponseError::new(
+        ResponseError::INTERNAL_ERROR,
+        format!("the server failed while handling `{method}`: the handler panicked: {why}"),
+    )
 }
 
 /// At most the first 64 bytes of `text` (on a character boundary), with an
 /// ellipsis when cut, so client-controlled text quoted in a log stays short.
 fn clip(text: &str) -> String {
-    if text.len() <= 64 {
+    clip_to(text, 64)
+}
+
+/// At most the first `max` bytes of `text`, on a character boundary, with an
+/// ellipsis when cut.
+fn clip_to(text: &str, max: usize) -> String {
+    if text.len() <= max {
         return text.to_owned();
     }
-    let mut end = 64;
+    let mut end = max;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
@@ -650,6 +999,10 @@ struct Session<G: Grammar> {
     phase: Phase,
     encoding: Encoding,
     workspace: Workspace<G>,
+    /// URIs the client opened but the grammar could not parse: not in the
+    /// workspace, but a whole-text change to one opens it. Bounded, like the
+    /// workspace, by the documents the client holds open.
+    unopened: BTreeSet<Box<str>>,
     wire: Wire,
 }
 
@@ -659,12 +1012,21 @@ impl<G: Grammar> Session<G> {
             phase: Phase::Uninitialized,
             encoding: Encoding::default(),
             workspace: Workspace::new(),
+            unopened: BTreeSet::new(),
             wire: Wire::default(),
         }
     }
 
     fn context(&mut self) -> Context<'_, G> {
         Context::new(&self.workspace, &mut self.wire)
+    }
+
+    /// Sends the response to the request whose raw id is `id`.
+    fn respond(&mut self, id: &str, result: &Result<Reply, ResponseError>) {
+        match result {
+            Ok(reply) => self.wire.outbox.respond(id, Ok(reply.as_str())),
+            Err(error) => self.wire.outbox.respond(id, Err(error)),
+        }
     }
 
     /// Reports a notification whose parameters could not be read.
@@ -729,8 +1091,37 @@ mod tests {
     // grammar bug.
     #[allow(clippy::panic)]
     fn test_guarded_turns_a_panic_into_an_error() {
-        let result: Result<(), String> = guarded(|| panic!("grammar bug"));
-        assert_eq!(result, Err("the grammar panicked".to_owned()));
+        let result: Result<(), Fault> = guarded(|| panic!("grammar bug"));
+        assert_eq!(result, Err(Fault::Panic("grammar bug".to_owned())));
         assert_eq!(guarded(|| Ok(7)), Ok(7));
+        let refused = incremental_lang::Error::Tokens { offset: 3 };
+        assert_eq!(guarded::<()>(|| Err(refused)), Err(Fault::Edit(refused)));
+    }
+
+    #[test]
+    #[allow(clippy::panic)]
+    fn test_caught_reports_the_panic_message_clipped() {
+        let owned = caught(|| panic!("{}", "x".repeat(1000)));
+        assert!(owned.is_err_and(|why| why.len() <= MAX_PANIC_MESSAGE + '…'.len_utf8()));
+        assert_eq!(
+            caught(|| panic!("static")),
+            Err::<(), _>("static".to_owned())
+        );
+        let opaque = caught(|| std::panic::panic_any(7_u8));
+        assert_eq!(
+            opaque,
+            Err::<(), _>("(a panic without a message)".to_owned())
+        );
+        assert_eq!(caught(|| 5), Ok(5));
+    }
+
+    #[test]
+    fn test_failure_levels_separate_drift_from_grammar_bugs() {
+        assert_eq!(Failure::Misplaced.level(), LOG_WARNING);
+        let too_large = incremental_lang::Error::TooLarge { len: 1 << 33 };
+        assert_eq!(Failure::Refused(too_large).level(), LOG_WARNING);
+        let panicked = Failure::Unparsable(Fault::Panic("bug".to_owned()));
+        assert_eq!(panicked.level(), LOG_ERROR);
+        assert!(panicked.to_string().contains("the grammar panicked: bug"));
     }
 }

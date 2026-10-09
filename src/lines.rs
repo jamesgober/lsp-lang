@@ -41,7 +41,6 @@ impl LineIndex {
     }
 
     /// Number of lines (always at least one).
-    #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.starts.len()
     }

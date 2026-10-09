@@ -115,6 +115,49 @@ document synchronization, message ordering, the public dependencies, and MSRV
 benchmarks green on Windows and Linux (WSL2) locally; macOS through the CI
 matrix.
 
+## v1.0.1 - Robustness patch (DONE)
+Fixes ISSUES M74 and M75 in `lang-collection/_lexersketch/ISSUES.md`. No
+public API added or removed.
+- [x] A failed `didChange` never loses the document; recovery documented.
+- [x] Every handler call contained; `initialize` output ordered; outstanding
+      requests bounded; malformed requests answered under their own id.
+- [x] Tests for each, including a handler that panics in each entry point.
+
+Delivered 2026-10-08:
+
+- **M74, a failed edit dropped the document.** Edits now take the
+  incremental path first and, if the grammar fails there, are applied again
+  by splicing the text and parsing it whole (`Document::rebuild`, private).
+  A change that cannot be applied at all leaves the document at its last
+  good state, marked out of step (`Document::is_stale`, private), and logged:
+  a warning for drift (a line the document lacks; a ranged change whose
+  version does not increase; a 4 GiB overflow), an error for a grammar that
+  fails on the whole text. A `didChange` is all or nothing (the starting text
+  is kept when it has several edits, and restored on failure). LSP has no
+  request for the client's text, so recovery is the next whole-text change
+  (applied in any state, any version) or a reopen; ranged changes to an
+  out-of-step document are ignored and logged meanwhile. A failed reopen keeps
+  the open document; a failed first open is remembered so a whole-text change
+  can open it.
+- **M75, handler panics killed the session.** Every handler call runs under
+  `catch_unwind`: a request whose handler panicked is answered with
+  `InternalError` and the panic message; any other panic is logged. Output a
+  handler sends during `initialize` is held back until after the response, or
+  discarded if it fails. The server's outstanding requests are a `BTreeSet`
+  capped at 1024: the oldest is cancelled (`$/cancelRequest` to the client,
+  `RequestCancelled` to `Handler::response` after the call returns), and
+  settling is O(log n). A request whose envelope does not parse is answered
+  under its own id when it has a `method` member and a valid id.
+- **Behaviour revised in the contract.** `docs/API.md#stability` recorded the
+  drop-on-failure rule and handler-first ordering during `initialize`; both
+  were the defects fixed here, and the stability section now records the
+  1.0.1 behaviour. Line numbers more than one past the last no longer clamp in
+  edits (they cannot be placed); position conversion through the public
+  `Document` methods is unchanged.
+
+Dependency wiring: unchanged. `incremental-lang` 1 (published, 1.0.0 on
+crates.io), `diag-lang` 1, `serde_json` 1, `serde` 1, `memchr` 2.
+
 Additive 1.x candidates (not commitments):
 
 - `Server::with_info(name, version)`, to send `serverInfo` in the `initialize`
@@ -126,3 +169,6 @@ Additive 1.x candidates (not commitments):
 - Deferred replies: answering a request after its handler returns (from a
   worker thread), which would make `$/cancelRequest` meaningful.
 - UTF-32 position encoding, for clients that offer it without UTF-8.
+- `Document::is_in_step()` (public), so a handler can tell a document kept at
+  its last good state from one that matches the client, and say so in hover
+  or diagnostics. 1.0.1 tracks this privately; exposing it is additive.

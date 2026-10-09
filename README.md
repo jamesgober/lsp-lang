@@ -53,11 +53,11 @@ What the server owns, and what it hands to the handler:
 | Message | Server | Handler |
 |---|---|---|
 | `initialize` | negotiates the position encoding; advertises document sync | [`initialize`](./docs/API.md#handlerinitialize) returns the language's capabilities |
-| `textDocument/didOpen`, `didChange` | applies the text, reparses incrementally, patches the line index | [`changed`](./docs/API.md#handlerchanged) analyses and publishes diagnostics |
+| `textDocument/didOpen`, `didChange` | applies the text, reparses incrementally (falling back to a full parse), patches the line index; never drops a document on a failed change | [`changed`](./docs/API.md#handlerchanged) analyses and publishes diagnostics |
 | `textDocument/didClose` | drops the document | [`closed`](./docs/API.md#handlerclosed) (default: clears its diagnostics) |
 | any other request | answers protocol errors (before `initialize`, after `shutdown`) | [`request`](./docs/API.md#handlerrequest) returns the result |
 | any other notification | drops it outside the session window | [`notification`](./docs/API.md#handlernotification) |
-| an answer from the client | delivers it if it answers an outstanding request, once; logs anything else | [`response`](./docs/API.md#handlerresponse) |
+| an answer from the client | delivers it if it answers an outstanding request, once; logs anything else; cancels the oldest beyond 1024 outstanding | [`response`](./docs/API.md#handlerresponse) |
 | `shutdown`, `exit` | ends the session | &mdash; |
 
 <hr>
@@ -286,8 +286,8 @@ A keystroke's cost is dominated by `incremental-lang`'s reparse and its text spl
 ## Design notes
 
 - **Synchronous and single-threaded.** One message at a time, handled to completion before the next is read. For an editor talking to one server over a pipe, this is the lowest-latency design: no locks, queues, or executor stand between the client and the handler. A handler with slow work can snapshot a document's tree (`O(1)`, `Send + Sync`) for a worker thread.
-- **The server owns document sync.** It advertises incremental sync with open/close notifications, applies every change, and drops a document whose edit cannot be applied (rather than serve positions for text the client no longer has), telling the client why with `window/logMessage`.
-- **Problems are reported, never panicked on.** Malformed JSON and invalid requests are answered with JSON-RPC errors; malformed notifications and stray answers from the client, which cannot be answered, are logged to the client. A panic in the grammar costs the document it was parsing, not the session. Only a broken transport, broken framing, the end of the session, or a panic in the handler's own code stops `run`.
+- **The server owns document sync.** It advertises incremental sync with open/close notifications, applies every change, and falls back to a full parse when an incremental reparse fails. A change it cannot apply at all (a line the document lacks, a version that does not increase, a grammar that fails on the whole text) never loses the document: it keeps its last good state, is marked out of step, and comes back on the next whole-text change or reopen, and the client is told why with `window/logMessage`.
+- **Problems are reported, never panicked on.** Malformed JSON and invalid requests are answered with JSON-RPC errors; malformed notifications and stray answers from the client, which cannot be answered, are logged to the client. A panic in the grammar or the handler is contained where panics unwind: a request whose handler panicked is answered with `InternalError`, any other panic is logged, and the session carries on. Only a broken transport, broken framing, or the end of the session stops `run`.
 - **Types the protocol needs, no more.** `Position` and `Range` are the crate's own; everything else a server sends or receives is the handler's own `Deserialize`/`Serialize` types or a `Value`, so the crate does not pin the server to one version of the full protocol type set.
 
 <hr>

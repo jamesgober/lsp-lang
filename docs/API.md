@@ -180,7 +180,10 @@ and 1 the protocol asks for.
 A message is classified by its members. With a `method` and an `id` it is a
 request; the id must be a string or an integer, and a request with any other
 id (`null`, a fraction, an object) is refused with `InvalidRequest` under a
-`null` id, without being dispatched. With a `method` and no `id` it is a
+`null` id, without being dispatched. A request whose envelope cannot be read
+(a `method` that is not a string, say) but whose `id` is a string or an
+integer is refused with `InvalidRequest` under that id. With a `method` and no
+`id` it is a
 notification. Without a `method` it is the client's answer to one of the
 server's own requests ([`Context::request`](#contextrequest)): it reaches
 [`Handler::response`](#handlerresponse) if, and only if, it answers a request
@@ -190,7 +193,10 @@ answer is logged and dropped. The server never replies to an answer.
 During `initialize`, the server negotiates the [position encoding](#encoding),
 asks [`Handler::initialize`](#handlerinitialize) for the language's
 capabilities, and adds the two it owns: `positionEncoding` and
-`textDocumentSync` (open/close notifications, incremental changes).
+`textDocumentSync` (open/close notifications, incremental changes). The
+`initialize` response is the first message the client receives: whatever the
+handler sends while answering is held back and follows it. If `initialize`
+fails, that held-back output is discarded.
 
 ### Document synchronization
 
@@ -202,19 +208,41 @@ to a byte span, applied to the text, reparsed incrementally, and folded into
 the line index, and then [`Handler::changed`](#handlerchanged) is called once.
 A whole-text change (no range) replaces the text.
 
-If an edit cannot be applied — the grammar's lexer broke its contract on the
-new text, the grammar panicked, or the text outgrew 4 GiB — the server cannot
-keep the document in step with the client. It drops the document, logs why to
-the client with `window/logMessage`, and calls
-[`Handler::closed`](#handlerclosed). A `didOpen` that fails the same way is
-logged too, and if a document was already open under that URI it is dropped
-(and `closed` called), since it no longer matches the client's text either.
-Changes to a document that is not open are logged and ignored.
+A failed change never loses the document. What happens depends on why it
+failed:
 
-A grammar panic costs the document, not the session: the server catches it
-where panics unwind. (A binary built with `panic = "abort"` ends instead, as
-that setting asks.) A panic in the handler's own code is not caught; it
-propagates out of [`run`](#serverrun).
+| Failure | What the server does |
+|---|---|
+| The incremental reparse of an edit failed: the grammar panicked, or its lexer broke its contract, on the reparsed fragment | Applies the same edit again by splicing it into the text and parsing the whole result, logs a warning naming the fault, and carries on: `changed` is called as usual. The document's incremental statistics start over. |
+| The grammar also fails on the whole new text, or the text would outgrow 4 GiB | Keeps the document at its last good state and marks it **out of step**; logs an error (grammar) or warning (size). |
+| An edit's range names a line the document does not have — more than one past its last line | Out of step, logged as a warning. The line just past the last is accepted and means the end of the text; a column past the end of its line is clamped, as the protocol prescribes. |
+| A change with only ranged edits carries a version no greater than the document's | Out of step, logged as a warning: versions only increase, so the change repeats one already applied or follows one that went missing. |
+
+A `didChange` is all or nothing: if any of its edits fails, the document goes
+back to the text it had before the first (its last good state), and its
+version stays the last one applied.
+
+A document out of step stays open, with the last good text, tree, and version,
+for handlers to read; `changed` is not called and `closed` is not called. The
+protocol has no request for the client's current text, so the server recovers
+when the client next sends it:
+
+- **a whole-text change** (a content change without a range) is applied
+  whatever state the document is in, whatever its version, and brings it back
+  in step; edits after it in the same `didChange` apply on top of it, and
+  edits before it are superseded;
+- **a reopen** (`didOpen` for the same URI) replaces it.
+
+Ranged changes to an out-of-step document are logged as warnings and ignored.
+A `didOpen` that fails (the grammar fails on the text, or it is over 4 GiB) is
+logged as an error; a document already open under that URI is kept, out of
+step, and otherwise the URI is remembered so a whole-text change can still
+open it. Changes to any other document that is not open are logged and
+ignored.
+
+A grammar panic costs at most the document's freshness, never the session: the
+server catches it where panics unwind. (A binary built with
+`panic = "abort"` ends instead, as that setting asks.)
 
 The parsing work of an edit is proportional to the edit. What stays linear in
 the size of the document is cheap: moving the text after the edit (one
@@ -267,12 +295,22 @@ writes `textDocument/publishDiagnostics` with the document's URI and version:
 | Kind | Type | Who sees it |
 |---|---|---|
 | A request failed | [`ResponseError`](#responseerror) | The client, as the request's error response. |
-| A notification could not be processed (malformed parameters, an edit that could not be applied, a grammar panic, a change to a document that is not open), or an answer from the client matched no outstanding request | `window/logMessage` | The client's log. Notifications and answers have no response, so this is the only channel. |
+| A notification could not be processed (malformed parameters, an edit that could not be applied, a grammar panic, a change to a document that is not open or is out of step, a handler panic outside a request), or an answer from the client matched no outstanding request | `window/logMessage` | The client's log. Notifications and answers have no response, so this is the only channel. |
 | The session cannot continue (the transport failed or closed, the framing broke, a message was too large, `exit` without `shutdown`) | [`Error`](#error) | The caller of [`run`](#serverrun), which should exit non-zero. |
 
 Malformed JSON and messages of the wrong shape are answered with `ParseError`
 (`-32700`) and `InvalidRequest` (`-32600`) and the session continues. Nothing in
 the crate panics on client input.
+
+A panic in the handler is contained the same way as one in the grammar, where
+panics unwind. A request whose handler panicked is answered with
+`InternalError` (`-32603`), its message carrying the panic's (clipped to 256
+bytes); a panic in any other handler method (`changed`, `closed`,
+`notification`, `response`) is logged as an error. Either way the session
+carries on with the same handler, and messages the handler sent before
+panicking are still sent; the handler's own state is whatever the panic left.
+A panic in `initialize` refuses it with `InternalError`, like an error
+return.
 
 ### Threading and performance
 
@@ -506,7 +544,8 @@ notifications to `output` until the client sends `exit`.
 | `output` | Where the server's messages go. Each turn's output is written with one `write_all` and flushed, so it need not be buffered. |
 
 Each call is a fresh session — uninitialized, no documents open — while the
-grammar and handler carry over.
+grammar and handler carry over. Nothing the client sends, and no panic in the
+grammar or the handler, ends the session (where panics unwind).
 
 **Errors.** `Ok(())` is a clean stop: `shutdown`, then `exit`. Otherwise one of
 [`Error`](#error)'s session-ending variants: `ExitWithoutShutdown`,
@@ -615,7 +654,9 @@ implements only what its language supports:
 | [`response`](#handlerresponse) | the client answers a [`Context::request`](#contextrequest) | ignored |
 
 Calls are made one at a time, in message order, on the thread running
-[`Server::run`](#serverrun). Every method receives a [`Context`](#context).
+[`Server::run`](#serverrun). Every method receives a [`Context`](#context). A
+panic in any method is contained where panics unwind (see
+[Three kinds of failure](#three-kinds-of-failure)).
 
 A handler that does not depend on the language can be written for every
 grammar at once — `impl<G: Grammar> Handler<G> for MyHandler` — as several
@@ -639,7 +680,13 @@ server adds `positionEncoding` and `textDocumentSync` before replying; other
 members of a `textDocumentSync` object the handler returns (such as `save`) are
 kept, while `openClose` and `change` are set by the server. A value that is not
 a JSON object is treated as `{}`. An error refuses `initialize`; the session
-stays uninitialized.
+stays uninitialized. A panic refuses it the same way, with `InternalError`.
+
+Anything sent through `cx` here is held back and written right after the
+`initialize` response, in the order sent, since the protocol lets a server send
+nothing before it has answered. If `initialize` fails, what was sent is
+discarded, and requests among it are forgotten (they get no
+[`response`](#handlerresponse)).
 
 ```rust
 use lsp_lang::incremental_lang::Grammar;
@@ -688,7 +735,9 @@ fn changed(&mut self, document: &Document<G>, cx: &mut Context<'_, G>)
 
 Called after a document opens and after each `didChange`, once its text and
 tree are current. The usual body analyses the document and publishes
-diagnostics. A `didChange` carrying several edits produces one call.
+diagnostics. A `didChange` carrying several edits produces one call. A change
+that leaves the document [out of step](#document-synchronization) produces no
+call; the next whole-text change or reopen does.
 
 | Parameter | Meaning |
 |---|---|
@@ -775,8 +824,9 @@ impl<G: Grammar> Handler<G> for Background {
 fn closed(&mut self, uri: &str, cx: &mut Context<'_, G>)
 ```
 
-Called after the document `uri` was closed and removed — by `didClose`, or
-because an edit to it could not be applied. The default clears its
+Called after the document `uri` was closed and removed by `didClose`. (A
+change that cannot be applied no longer closes a document; see
+[Document synchronization](#document-synchronization).) The default clears its
 diagnostics, as the protocol recommends; an override that keeps per-document
 state should drop it here and call
 [`Context::clear_diagnostics`](#contextclear_diagnostics) itself.
@@ -1038,7 +1088,9 @@ Receives the client's answer to a request sent with
 [`Context::request`](#contextrequest). Each request is answered at most once:
 an answer that matches no request still awaiting one — a second answer, an id
 the server never sent, an answer with no id — is logged and dropped, and the
-server never replies to an answer.
+server never replies to an answer. A request cancelled to stay under the cap
+on outstanding requests (see [`Context::request`](#contextrequest)) receives
+`RequestCancelled` (`-32800`) here instead, once.
 
 | Parameter | Meaning |
 |---|---|
@@ -1205,6 +1257,13 @@ pub fn request<P: Serialize + ?Sized>(&mut self, method: &str, params: &P) -> Re
 Sends a request to the client and returns the id it was sent with; the answer
 arrives later through [`Handler::response`](#handlerresponse) with the same
 id, exactly once. Ids count up from 0 in each session.
+
+At most **1024** requests await an answer at once. Sending one more cancels
+the oldest still outstanding: the server sends the client `$/cancelRequest`
+for it and, once the current handler call returns, delivers `RequestCancelled`
+(`-32800`) to [`Handler::response`](#handlerresponse) as its answer. A late
+answer from the client is then logged and dropped. Settling an answer costs
+O(log n) in the number outstanding.
 
 | Parameter | Meaning |
 |---|---|
@@ -2237,13 +2296,20 @@ As of `1.0.0` the public API is frozen. lsp-lang follows
   which part of a `Diagnostic` becomes which protocol field, the severity
   mapping, and the order of the message's lines.
 - **Document synchronization** is fixed: every edit of a `didChange` is applied
-  in order before one [`changed`](#handlerchanged) call; an edit that cannot be
-  applied drops the document, logs to the client, and calls
-  [`closed`](#handlerclosed).
+  in order before one [`changed`](#handlerchanged) call; a change that cannot
+  be applied keeps the document at its last good state, out of step, until a
+  whole-text change or a reopen, as described in
+  [Document synchronization](#document-synchronization). (Revised in 1.0.1:
+  1.0.0 dropped the document and called [`closed`](#handlerclosed), which left
+  language features dead for that file until it was reopened.)
 - **Ordering** is fixed: messages a handler sends go out in the order sent,
   before the response to the request being handled, all before the next
-  incoming message is read. Ids from [`Context::request`](#contextrequest)
-  count up from 0 in each session.
+  incoming message is read — except during `initialize`, whose response goes
+  first (revised in 1.0.1, as the protocol requires). Ids from
+  [`Context::request`](#contextrequest) count up from 0 in each session.
+- **Containment** is fixed (since 1.0.1): a panic in the grammar or the
+  handler never ends the session where panics unwind; at most 1024 of the
+  server's requests are outstanding, the oldest cancelled first.
 - `Encoding` and `Error` are `#[non_exhaustive]`, so variants can be added in a
   minor release; match them with a wildcard arm.
 - `incremental-lang`, `diag-lang`, `serde_json`, and `serde` are **public

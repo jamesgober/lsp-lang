@@ -1,7 +1,10 @@
 //! [`Context`]: what a handler can reach while it runs — the open documents,
 //! and a channel back to the client.
 
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use diag_lang::Diagnostic;
 use incremental_lang::Grammar;
@@ -60,25 +63,68 @@ pub(crate) struct Wire {
     scratch: Scratch,
 }
 
-/// The server's own requests to the client: the next id to use, and the ids
-/// still awaiting an answer (a handful at most, so a vector).
+/// Most of the server's own requests that may await an answer at once. A
+/// client answers each in turn, so a real session keeps a handful
+/// outstanding; the cap only bounds a handler that sends requests the client
+/// never answers. Issuing one more cancels the oldest (see [`Requests::issue`]).
+pub(crate) const MAX_PENDING_REQUESTS: usize = 1024;
+
+/// The server's own requests to the client: the next id to use, the ids still
+/// awaiting an answer, and the ids cancelled for want of room, whose handler
+/// has not been told yet.
+///
+/// Ids count up from 0, so the smallest pending id is the oldest request (ids
+/// would wrap only after 2^64 requests). A `BTreeSet` gives the O(log n)
+/// settle and the O(log n) "remove the oldest" the cap needs.
 #[derive(Debug, Default)]
 pub(crate) struct Requests {
     next: u64,
-    pending: Vec<u64>,
+    pending: BTreeSet<u64>,
+    cancelled: Vec<u64>,
 }
 
 impl Requests {
-    /// Marks `id` answered. Returns `false` if no request with that id is
-    /// outstanding — a forged, duplicate, or stray answer.
-    pub(crate) fn settle(&mut self, id: u64) -> bool {
-        match self.pending.iter().position(|&p| p == id) {
-            Some(at) => {
-                let _settled = self.pending.swap_remove(at);
-                true
-            }
-            None => false,
+    /// Records `id` as awaiting an answer. At the cap, the oldest outstanding
+    /// request is dropped to make room, and its id is returned so the caller
+    /// can tell the client; the server tells the handler once the current call
+    /// returns (see [`take_cancelled`](Requests::take_cancelled)).
+    fn issue(&mut self, id: u64) -> Option<u64> {
+        let evicted = if self.pending.len() >= MAX_PENDING_REQUESTS {
+            self.pending.pop_first()
+        } else {
+            None
+        };
+        let _fresh = self.pending.insert(id);
+        if let Some(oldest) = evicted {
+            self.cancelled.push(oldest);
         }
+        evicted
+    }
+
+    /// Marks `id` answered. Returns `false` if no request with that id is
+    /// outstanding — a forged, duplicate, or stray answer, or an answer to a
+    /// request cancelled to stay under the cap.
+    pub(crate) fn settle(&mut self, id: u64) -> bool {
+        self.pending.remove(&id)
+    }
+
+    /// Takes the ids cancelled since the last call, oldest first.
+    pub(crate) fn take_cancelled(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.cancelled)
+    }
+
+    /// Forgets every outstanding and cancelled request. Used when `initialize`
+    /// fails: what the handler sent during it is never written, so nothing
+    /// will answer it.
+    pub(crate) fn forget(&mut self) {
+        self.pending.clear();
+        self.cancelled.clear();
+    }
+
+    /// How many requests await an answer, for tests.
+    #[cfg(test)]
+    pub(crate) fn outstanding(&self) -> usize {
+        self.pending.len()
     }
 }
 
@@ -160,6 +206,13 @@ impl<'a, G: Grammar> Context<'a, G> {
     /// answer and delivers exactly one answer for each; anything else that
     /// looks like a response is logged and dropped.
     ///
+    /// At most 1024 requests await an answer at once. Sending one more cancels
+    /// the oldest outstanding request: the server sends the client
+    /// `$/cancelRequest` for it and, once the current handler call returns,
+    /// delivers [`REQUEST_CANCELLED`](crate::ResponseError::REQUEST_CANCELLED)
+    /// as its answer. An answer the client sends for it afterwards is logged
+    /// and dropped, so each request is still answered exactly once.
+    ///
     /// # Errors
     ///
     /// [`Error::Json`] if `params` fails to serialize. Nothing is sent, and no
@@ -185,7 +238,11 @@ impl<'a, G: Grammar> Context<'a, G> {
         let id = requests.next;
         self.wire.outbox.request(id, method, params)?;
         requests.next = id.wrapping_add(1);
-        requests.pending.push(id);
+        if let Some(oldest) = requests.issue(id) {
+            // Tell the client to stop working on it; any answer it still
+            // sends is logged and dropped, since the id is no longer pending.
+            self.wire.outbox.cancel(oldest);
+        }
         Ok(id)
     }
 
@@ -295,5 +352,53 @@ impl<G: Grammar> fmt::Debug for Context<'_, G> {
             .field("documents", &self.workspace.len())
             .field("next_id", &self.wire.requests.next)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_requests_settle_each_id_once() {
+        let mut requests = Requests::default();
+        for id in 0..3 {
+            assert_eq!(requests.issue(id), None);
+        }
+        assert!(requests.settle(1));
+        assert!(!requests.settle(1), "a second answer is refused");
+        assert!(!requests.settle(99), "an id never issued is refused");
+        assert_eq!(requests.outstanding(), 2);
+    }
+
+    #[test]
+    fn test_requests_at_the_cap_cancel_the_oldest() {
+        let mut requests = Requests::default();
+        let cap = MAX_PENDING_REQUESTS as u64;
+        for id in 0..cap {
+            assert_eq!(requests.issue(id), None);
+        }
+        // Answering one makes room without cancelling anything.
+        assert!(requests.settle(5));
+        assert_eq!(requests.issue(cap), None);
+        // Now full again: each new request cancels the oldest still waiting.
+        assert_eq!(requests.issue(cap + 1), Some(0));
+        assert_eq!(requests.issue(cap + 2), Some(1));
+        assert_eq!(requests.outstanding(), MAX_PENDING_REQUESTS);
+        assert_eq!(requests.take_cancelled(), [0, 1]);
+        assert!(requests.take_cancelled().is_empty());
+        assert!(!requests.settle(0), "a cancelled request takes no answer");
+        assert!(requests.settle(cap + 2));
+    }
+
+    #[test]
+    fn test_requests_forget_clears_everything_but_the_counter() {
+        let mut requests = Requests::default();
+        for id in 0..=MAX_PENDING_REQUESTS as u64 {
+            let _cancelled = requests.issue(id);
+        }
+        requests.forget();
+        assert_eq!(requests.outstanding(), 0);
+        assert!(requests.take_cancelled().is_empty());
     }
 }

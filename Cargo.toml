@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lsp-lang"
-version = "1.0.0"
+version = "1.0.1"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"

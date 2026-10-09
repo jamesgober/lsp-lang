@@ -100,6 +100,9 @@ pub struct Document<G: Grammar> {
     encoding: Encoding,
     lines: LineIndex,
     source: incremental_lang::Document<G>,
+    /// Set when the client's text could not be followed; see
+    /// [`is_stale`](Document::is_stale).
+    stale: bool,
 }
 
 impl<G: Grammar> Document<G> {
@@ -119,22 +122,38 @@ impl<G: Grammar> Document<G> {
             encoding,
             lines,
             source,
+            stale: false,
         })
     }
 
-    /// Applies one content change: replaces `range` (the whole text when
-    /// `None`) with `text`, reparses, and patches the line index.
+    /// Converts a content change's range to the byte span it replaces: the
+    /// whole text when `range` is `None`.
     ///
-    /// The change is transactional: on error the document is unchanged.
-    pub(crate) fn change(
-        &mut self,
-        range: Option<Range>,
-        text: &str,
-    ) -> Result<(), incremental_lang::Error> {
-        let span = match range {
-            Some(range) => self.span(range),
-            None => Span::new(0, self.source.text().len() as u32),
+    /// Returns `None` when the range names a line the document does not have
+    /// — more than one past its last line. The client's text then has lines
+    /// this copy lacks, so the two have drifted apart and the edit cannot be
+    /// placed. The line just past the last (column 0 or any other) is accepted
+    /// and means the end of the text, as clients use it for "end of document".
+    /// Every other out-of-range part of a position is clamped as
+    /// [`offset`](Document::offset) describes: a column past the end of its
+    /// line is the end of that line, as the protocol prescribes.
+    pub(crate) fn edit_span(&self, range: Option<Range>) -> Option<Span> {
+        let Some(range) = range else {
+            return Some(Span::new(0, self.source.text().len() as u32));
         };
+        let lines = self.lines.len();
+        let exists = |at: Position| (at.line as usize) <= lines;
+        (exists(range.start) && exists(range.end)).then(|| self.span(range))
+    }
+
+    /// Applies one edit by incremental reparse: replaces `span` with `text`,
+    /// reparses the innermost reparsable node around it, and patches the line
+    /// index.
+    ///
+    /// Transactional: on error, or a panic in the grammar, the document is
+    /// unchanged (`incremental-lang` swaps the text and tree in only once the
+    /// new tree is complete, and the line index is patched after that).
+    pub(crate) fn edit(&mut self, span: Span, text: &str) -> Result<(), incremental_lang::Error> {
         // What was rebuilt is the incremental document's business; the line
         // index only needs the edit itself.
         let _reparse = self.source.edit(span, text)?;
@@ -148,16 +167,30 @@ impl<G: Grammar> Document<G> {
         Ok(())
     }
 
+    /// Whether this copy is known to differ from the client's text: an edit
+    /// could not be placed or parsed, so the document kept its last good
+    /// state. Only a whole-text change or a reopen brings it back in step.
+    pub(crate) fn is_stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Marks the document as out of step with the client.
+    pub(crate) fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
+    /// Records the version the client gave the latest change, which this copy
+    /// now matches.
+    pub(crate) fn synced(&mut self, version: i32) {
+        self.version = version;
+        self.stale = false;
+    }
+
     /// Converts many byte offsets at once (see [`LineIndex::positions`]);
     /// `order` is scratch.
     pub(crate) fn positions(&self, offsets: &[u32], order: &mut Vec<u32>, out: &mut Vec<Position>) {
         self.lines
             .positions(self.source.text(), offsets, self.encoding, order, out);
-    }
-
-    /// Records the version the client gave the latest change.
-    pub(crate) fn set_version(&mut self, version: i32) {
-        self.version = version;
     }
 
     /// Returns the document's URI, exactly as the client sent it.
@@ -386,6 +419,50 @@ impl<G: Grammar> Document<G> {
     }
 }
 
+impl<G: Grammar + Clone> Document<G> {
+    /// Applies one edit by full reparse: splices `text` into the text in
+    /// place of `span`, then parses the result from scratch with a clone of
+    /// the grammar. The fallback for an edit whose incremental reparse failed
+    /// (a grammar panic or contract break in the reparsed fragment), which a
+    /// whole-text parse may still survive.
+    ///
+    /// Transactional: nothing changes unless the new parse succeeds. The
+    /// incremental statistics start over with the new document.
+    pub(crate) fn rebuild(
+        &mut self,
+        span: Span,
+        text: &str,
+    ) -> Result<(), incremental_lang::Error> {
+        let old = self.source.text();
+        let (start, end) = (span.start().to_usize(), span.end().to_usize());
+        if end > old.len() {
+            return Err(incremental_lang::Error::OutOfBounds {
+                span,
+                len: old.len() as u32,
+            });
+        }
+        if let Some(&offset) = [start, end].iter().find(|&&at| !old.is_char_boundary(at)) {
+            return Err(incremental_lang::Error::NotCharBoundary {
+                offset: offset as u32,
+            });
+        }
+        let mut spliced = String::with_capacity(old.len() - (end - start) + text.len());
+        spliced.push_str(&old[..start]);
+        spliced.push_str(text);
+        spliced.push_str(&old[end..]);
+        self.reset(spliced)
+    }
+
+    /// Replaces the text with `text`, parsed from scratch. Transactional, like
+    /// [`rebuild`](Document::rebuild).
+    pub(crate) fn reset(&mut self, text: String) -> Result<(), incremental_lang::Error> {
+        let source = incremental_lang::Document::new(self.source.grammar().clone(), text)?;
+        self.lines = LineIndex::new(source.text());
+        self.source = source;
+        Ok(())
+    }
+}
+
 impl<G: Grammar> fmt::Debug for Document<G> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Document")
@@ -393,6 +470,7 @@ impl<G: Grammar> fmt::Debug for Document<G> {
             .field("version", &self.version)
             .field("encoding", &self.encoding)
             .field("len", &self.source.text().len())
+            .field("stale", &self.stale)
             .finish_non_exhaustive()
     }
 }
@@ -411,12 +489,23 @@ mod tests {
         Document::open(Chars, "file:///t", 1, text.to_owned(), encoding)
     }
 
+    /// Applies one content change the way the server does on the fast path.
+    fn change(doc: &mut Document<Chars>, range: Option<Range>, text: &str) -> Result {
+        let span = doc
+            .edit_span(range)
+            .ok_or(incremental_lang::Error::OutOfBounds {
+                span: Span::new(0, 0),
+                len: 0,
+            })?;
+        doc.edit(span, text)
+    }
+
     #[test]
     fn test_change_with_range_applies_utf16_edit() -> Result {
         let mut doc = open("a😀b\nc", Encoding::Utf16)?;
         // Replace the emoji: columns 1..3 in UTF-16.
         let range = Range::new(Position::new(0, 1), Position::new(0, 3));
-        doc.change(Some(range), "é")?;
+        change(&mut doc, Some(range), "é")?;
         assert_eq!(doc.text(), "aéb\nc");
         assert_eq!(doc.position(5), Position::new(1, 0));
         assert_eq!(doc.lines, LineIndex::new(doc.text()));
@@ -426,9 +515,74 @@ mod tests {
     #[test]
     fn test_change_without_range_replaces_everything() -> Result {
         let mut doc = open("old\ntext", Encoding::Utf8)?;
-        doc.change(None, "new")?;
+        change(&mut doc, None, "new")?;
         assert_eq!(doc.text(), "new");
         assert_eq!(doc.lines, LineIndex::new("new"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_edit_span_refuses_lines_the_document_does_not_have() -> Result {
+        let doc = open(
+            "ab
+cd",
+            Encoding::Utf16,
+        )?; // two lines: 0 and 1
+        let at = |line, character| Position::new(line, character);
+        let range = |a, b| Some(Range::new(a, b));
+        // A column past the end of its line clamps, as the protocol says.
+        assert_eq!(
+            doc.edit_span(range(at(0, 99), at(0, 99))),
+            Some(Span::new(2, 2))
+        );
+        // The line just past the last means the end of the text.
+        assert_eq!(
+            doc.edit_span(range(at(2, 0), at(2, 7))),
+            Some(Span::new(5, 5))
+        );
+        // Further than that, the client has lines this copy lacks.
+        assert_eq!(doc.edit_span(range(at(3, 0), at(3, 0))), None);
+        assert_eq!(doc.edit_span(range(at(0, 0), at(u32::MAX, 0))), None);
+        // A whole-text change always applies.
+        assert_eq!(doc.edit_span(None), Some(Span::new(0, 5)));
+        Ok(())
+    }
+
+    #[test]
+    fn test_rebuild_splices_and_reparses_from_scratch() -> Result {
+        let mut doc = open(
+            "one
+two",
+            Encoding::Utf8,
+        )?;
+        doc.rebuild(
+            Span::new(3, 4),
+            "😀
+",
+        )?;
+        assert_eq!(
+            doc.text(),
+            "one😀
+two"
+        );
+        assert_eq!(doc.lines, LineIndex::new(doc.text()));
+        assert_eq!(doc.incremental().stats().full, 1);
+        // Spans that cannot be placed are refused, leaving the text alone.
+        let before = doc.text().to_owned();
+        assert!(doc.rebuild(Span::new(4, 4), "x").is_err()); // inside the emoji
+        assert!(doc.rebuild(Span::new(0, 99), "x").is_err());
+        assert_eq!(doc.text(), before);
+        Ok(())
+    }
+
+    #[test]
+    fn test_stale_flag_clears_on_sync() -> Result {
+        let mut doc = open("x", Encoding::Utf8)?;
+        assert!(!doc.is_stale());
+        doc.mark_stale();
+        assert!(doc.is_stale() && doc.version() == 1);
+        doc.synced(4);
+        assert!(!doc.is_stale() && doc.version() == 4);
         Ok(())
     }
 
