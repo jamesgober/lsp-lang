@@ -172,3 +172,78 @@ Additive 1.x candidates (not commitments):
 - `Document::is_in_step()` (public), so a handler can tell a document kept at
   its last good state from one that matches the client, and say so in hover
   or diagnostics. 1.0.1 tracks this privately; exposing it is additive.
+
+## v2.0.0 - Our own stack (DONE)
+Removes every third-party runtime dependency (`serde`, `serde_json`, `memchr`)
+by rebuilding on `rpc-io` and `jsonx-lib` (LexerSketch decisions D25 and D29),
+and adds the typed features LexerSketch's `lsk lsp` needs. A major release:
+the breaking changes and a migration table are in `CHANGELOG.md`.
+- [x] `serde`, `serde_json`, and `memchr` removed completely; zero third-party
+      runtime dependencies (`cargo tree --edges normal` lists only family crates).
+- [x] Everything 1.x did, ported: lifecycle, incremental and whole-text sync
+      through `incremental-lang`, `diag-lang` diagnostics, a failed edit never
+      drops the document, contained handler and grammar panics, the request cap.
+- [x] Typed helpers with hand-written JSON (no derives): semantic tokens (full
+      and delta, with a legend and a builder), hierarchical document symbols,
+      go to definition, hover (Markdown), completion.
+- [x] `$/cancelRequest` cancels, through `rpc-io`.
+- [x] A Tier-1 API: `Handler` with defaults, `Features` from which capabilities
+      are advertised, `serve_stdio`.
+- [x] Tests: in-memory-pipe conformance, UTF-16 and UTF-8 position properties
+      (surrogate pairs included), random edits equal the full text, hostile
+      input, every 1.x test that still applies, ported.
+- [x] Docs: README, `docs/API.md` for every public item, CHANGELOG with a
+      migration table, `docs/release/v2.0.0.md`.
+
+Delivered 2026-10-13.
+
+Design decisions, recorded under the anti-deferral rule:
+
+- **Capabilities are declared, not inferred.** Rust cannot tell which default
+  methods an implementation overrode, so `Handler::features` lists what is
+  offered. The server answers `MethodNotFound` for a feature that is not listed
+  and for a listed feature whose method was left at its default. This is the
+  one place the "advertised from what it implements" goal needed a declaration.
+- **Cancellation is real but does not interrupt a running handler.** The server
+  is single-threaded. It queues what it reads and runs the queue only when its
+  input has nothing buffered, so a `$/cancelRequest` that arrives with, or just
+  behind, the request it names is applied before the request runs. A request
+  already inside a handler runs to completion, because nothing reads the
+  cancellation until the handler returns. Interrupting a running handler needs a
+  reader thread and a shared handler; that is a different server, not an
+  addition to this one, and is not planned.
+- **`initialize` runs at once.** Everything else waits in the queue; `initialize`
+  does not, because the transport's gate refuses what follows it until it is
+  answered and a client may pipeline.
+- **Notifications the crate writes itself skip the transport's validation and
+  copies** once the session runs (diagnostics, log lines). They are the crate's
+  own output; debug builds, including every test, validate each one. With the
+  validation, `publish/long_line_10000` was ~3x slower than 1.x.
+- **Inherent `to_json`/`from_json`, not traits.** `jsonx-lib` 0.2 has no
+  `ToJson`/`FromJson`. When it does, lsp-lang will implement them in a minor
+  release; the inherent methods stay.
+- **UTF-32 is not negotiated**, as in 1.x.
+
+Dependency wiring:
+
+- `rpc-io` 0.2 (new): the transport. Its `Decoder`, `Endpoint`, `Router`, gate,
+  cancellation, `Peer`, `Call`, and `Responder` are used; `Framing::ContentLength`
+  is LSP's base protocol.
+- `jsonx-lib` 0.2 (new): the JSON.
+- `incremental-lang` 1, `diag-lang` 1: unchanged.
+- `serde`, `serde_json`, `memchr`: removed.
+- Dev-dependencies: `criterion`, `proptest`, and the first-party `symbol-lang` and
+  `intern-lang` (for the examples). `criterion` and `proptest` pull third-party
+  crates for tests and benchmarks only.
+
+Not delivered, and why (candidates for 2.x, all additive):
+
+- Documents for files the client has not opened (cross-file definitions carry
+  ranges only from open documents).
+- `Document::is_in_step()` as a public method.
+- UTF-32 position encoding.
+- `semanticTokens/range`, `textDocument/references`, `rename`, `codeAction`,
+  `formatting`, workspace symbols: nothing LexerSketch needs yet; `Features::capability`
+  plus `Handler::request` carry any of them meanwhile.
+- Coalescing several queued `didChange`s of one document into one `changed`
+  call (the queue makes it possible; not done, since each change is observable).

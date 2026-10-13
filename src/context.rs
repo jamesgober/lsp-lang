@@ -1,38 +1,154 @@
-//! [`Context`]: what a handler can reach while it runs — the open documents,
-//! and a channel back to the client.
+//! [`Context`]: what a handler can reach while it runs, the open documents and
+//! a channel back to the client.
 
-use std::{
-    collections::{BTreeMap, BTreeSet},
-    fmt,
-};
+use std::{collections::BTreeMap, fmt};
 
 use diag_lang::Diagnostic;
 use incremental_lang::Grammar;
-use serde::Serialize;
+use rpc_io::{Call, Json, Peer};
 
 use crate::{
     diagnostics::{Scratch, write_clear, write_publish},
     document::Document,
     error::Error,
-    transport::Outbox,
+    json::{trusted_raw, write_i64, write_str},
+    outbox::Outbox,
 };
 
-/// The open documents, keyed by URI. Ordered, so iteration — and anything a
-/// handler publishes while iterating — is the same from run to run.
+/// The open documents, keyed by URI. Ordered, so iteration, and anything a
+/// handler publishes while iterating, is the same from run to run.
 pub(crate) type Workspace<G> = BTreeMap<Box<str>, Document<G>>;
+
+/// How serious a message shown or logged by the client is
+/// (`MessageType` in the protocol).
+///
+/// # Examples
+///
+/// ```
+/// use lsp_lang::MessageType;
+///
+/// assert_eq!(MessageType::Warning.as_u32(), 2);
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum MessageType {
+    /// Something failed (`1`).
+    Error = 1,
+    /// Something is probably wrong (`2`).
+    Warning = 2,
+    /// Information (`3`).
+    Info = 3,
+    /// Trace output for the client's log (`4`).
+    Log = 4,
+}
+
+impl MessageType {
+    /// The protocol's number for this type.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use lsp_lang::MessageType;
+    ///
+    /// assert_eq!(MessageType::Log.as_u32(), 4);
+    /// ```
+    #[must_use]
+    pub const fn as_u32(self) -> u32 {
+        self as u32
+    }
+}
+
+/// Everything a session sends with: the connection's sending handle, the
+/// server's own requests awaiting an answer, and scratch space reused across
+/// notifications.
+pub(crate) struct Wire {
+    pub(crate) peer: Peer,
+    /// The server's own requests, until their outcome is delivered.
+    pub(crate) calls: Vec<Call>,
+    /// The first send that failed during the current call, for the session to
+    /// act on once the handler returns.
+    pub(crate) failure: Option<Error>,
+    scratch: Scratch,
+    text: String,
+    /// Where notifications the crate writes itself may go straight to, once
+    /// the session is running; see [`Wire::send_text`].
+    outbox: Outbox,
+    direct: bool,
+}
+
+impl Wire {
+    pub(crate) fn new(peer: Peer, outbox: Outbox) -> Self {
+        Self {
+            peer,
+            calls: Vec::new(),
+            failure: None,
+            scratch: Scratch::default(),
+            text: String::new(),
+            outbox,
+            direct: false,
+        }
+    }
+
+    /// Lets notifications the crate writes itself bypass the transport's
+    /// message model (see [`Wire::send_text`]). Set when `initialize`
+    /// succeeds, the first moment the client is ready for them.
+    pub(crate) fn go_direct(&mut self, direct: bool) {
+        self.direct = direct;
+    }
+
+    /// Sends `window/logMessage`.
+    pub(crate) fn log(&mut self, kind: MessageType, message: &str) {
+        self.text.clear();
+        self.text.push_str("{\"type\":");
+        write_i64(&mut self.text, i64::from(kind.as_u32()));
+        self.text.push_str(",\"message\":");
+        write_str(&mut self.text, message);
+        self.text.push('}');
+        self.send_text("window/logMessage");
+    }
+
+    /// Sends the notification `method` whose params are in `self.text`.
+    ///
+    /// A running session frames it straight into the outgoing buffer. The text
+    /// is JSON this crate just wrote, so the transport's pass to validate it
+    /// and its copies into the message model would only repeat the writer's
+    /// work, and for a diagnostics notification of a few megabytes they are
+    /// more than half the cost. (Debug builds, which include the tests, still
+    /// validate every message before it is sent.) Before the session runs,
+    /// the transport holds notifications until `initialize` is answered, so
+    /// they go through it.
+    fn send_text(&mut self, method: &str) {
+        if self.direct && (!cfg!(debug_assertions) || trusted_raw(&self.text).is_ok()) {
+            self.outbox.push_notification(method, &self.text);
+            return;
+        }
+        let result = trusted_raw(&self.text)
+            .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))
+            .and_then(|raw| self.peer.notify(method, raw).map_err(Error::from));
+        if let Err(error) = result {
+            self.remember_failure(error);
+        }
+    }
+
+    pub(crate) fn remember_failure(&mut self, error: Error) {
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+    }
+}
 
 /// A handler's view of the session for the duration of one call.
 ///
 /// Every [`Handler`](crate::Handler) method receives one. Through it a handler
 /// reads the open documents and talks back to the client: notifications
 /// ([`notify`](Context::notify)), server-to-client requests
-/// ([`request`](Context::request)), and diagnostics
-/// ([`publish_diagnostics`](Context::publish_diagnostics)).
+/// ([`request`](Context::request)), log messages ([`log`](Context::log)), and
+/// diagnostics ([`publish_diagnostics`](Context::publish_diagnostics)).
 ///
-/// Messages sent through a context are buffered and written to the client in
-/// one write, in the order they were sent, as soon as the handler returns —
-/// before the server reads the next message. A response to the request being
-/// handled, if there is one, is written after them.
+/// Messages sent through a context are written to the client in one write, in
+/// the order they were sent, as soon as the handler returns, before the server
+/// reads the next message. The response to the request being handled, if there
+/// is one, is written after them.
 ///
 /// Documents borrowed from a context live for the whole call (`'a`), not just
 /// for the borrow of the context, so a handler can hold a document and send
@@ -53,81 +169,6 @@ pub struct Context<'a, G: Grammar> {
     wire: &'a mut Wire,
 }
 
-/// Everything a session sends with: the outgoing messages, the bookkeeping for
-/// the server's own requests, and scratch space reused across diagnostics
-/// batches.
-#[derive(Debug, Default)]
-pub(crate) struct Wire {
-    pub(crate) outbox: Outbox,
-    pub(crate) requests: Requests,
-    scratch: Scratch,
-}
-
-/// Most of the server's own requests that may await an answer at once. A
-/// client answers each in turn, so a real session keeps a handful
-/// outstanding; the cap only bounds a handler that sends requests the client
-/// never answers. Issuing one more cancels the oldest (see [`Requests::issue`]).
-pub(crate) const MAX_PENDING_REQUESTS: usize = 1024;
-
-/// The server's own requests to the client: the next id to use, the ids still
-/// awaiting an answer, and the ids cancelled for want of room, whose handler
-/// has not been told yet.
-///
-/// Ids count up from 0, so the smallest pending id is the oldest request (ids
-/// would wrap only after 2^64 requests). A `BTreeSet` gives the O(log n)
-/// settle and the O(log n) "remove the oldest" the cap needs.
-#[derive(Debug, Default)]
-pub(crate) struct Requests {
-    next: u64,
-    pending: BTreeSet<u64>,
-    cancelled: Vec<u64>,
-}
-
-impl Requests {
-    /// Records `id` as awaiting an answer. At the cap, the oldest outstanding
-    /// request is dropped to make room, and its id is returned so the caller
-    /// can tell the client; the server tells the handler once the current call
-    /// returns (see [`take_cancelled`](Requests::take_cancelled)).
-    fn issue(&mut self, id: u64) -> Option<u64> {
-        let evicted = if self.pending.len() >= MAX_PENDING_REQUESTS {
-            self.pending.pop_first()
-        } else {
-            None
-        };
-        let _fresh = self.pending.insert(id);
-        if let Some(oldest) = evicted {
-            self.cancelled.push(oldest);
-        }
-        evicted
-    }
-
-    /// Marks `id` answered. Returns `false` if no request with that id is
-    /// outstanding — a forged, duplicate, or stray answer, or an answer to a
-    /// request cancelled to stay under the cap.
-    pub(crate) fn settle(&mut self, id: u64) -> bool {
-        self.pending.remove(&id)
-    }
-
-    /// Takes the ids cancelled since the last call, oldest first.
-    pub(crate) fn take_cancelled(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.cancelled)
-    }
-
-    /// Forgets every outstanding and cancelled request. Used when `initialize`
-    /// fails: what the handler sent during it is never written, so nothing
-    /// will answer it.
-    pub(crate) fn forget(&mut self) {
-        self.pending.clear();
-        self.cancelled.clear();
-    }
-
-    /// How many requests await an answer, for tests.
-    #[cfg(test)]
-    pub(crate) fn outstanding(&self) -> usize {
-        self.pending.len()
-    }
-}
-
 impl<'a, G: Grammar> Context<'a, G> {
     pub(crate) fn new(workspace: &'a Workspace<G>, wire: &'a mut Wire) -> Self {
         Self { workspace, wire }
@@ -141,7 +182,7 @@ impl<'a, G: Grammar> Context<'a, G> {
     ///
     /// ```
     /// # use lsp_lang::incremental_lang::Grammar;
-    /// use lsp_lang::{Context, Position};
+    /// use lsp_lang::Context;
     ///
     /// fn line_count<G: Grammar>(cx: &Context<'_, G>, uri: &str) -> Option<u32> {
     ///     let doc = cx.document(uri)?;
@@ -162,7 +203,7 @@ impl<'a, G: Grammar> Context<'a, G> {
     /// # use lsp_lang::incremental_lang::Grammar;
     /// use lsp_lang::Context;
     ///
-    /// // Total bytes the client has open — for a status message, say.
+    /// // Total bytes the client has open, for a status message, say.
     /// fn open_bytes<G: Grammar>(cx: &Context<'_, G>) -> usize {
     ///     cx.documents().map(|doc| doc.text().len()).sum()
     /// }
@@ -173,14 +214,15 @@ impl<'a, G: Grammar> Context<'a, G> {
 
     /// Sends a notification to the client.
     ///
-    /// `params` is serialized straight into the outgoing message: any
-    /// `Serialize` type, including a [`Value`](crate::Value) built with
-    /// [`json!`](crate::json).
+    /// `params` is a [`Value`](crate::Value) built with [`json!`](crate::json),
+    /// or a pre-serialized [`Raw`](crate::rpc_io::Raw): an array, an object, or
+    /// `()` for none.
     ///
     /// # Errors
     ///
-    /// [`Error::Json`] if `params` fails to serialize. Nothing is sent in that
-    /// case, and the session carries on.
+    /// [`Error::InvalidParams`] if `params` is a scalar, [`Error::Closed`] if
+    /// the connection has ended. Nothing is sent in either case, and the
+    /// session carries on.
     ///
     /// # Examples
     ///
@@ -190,33 +232,34 @@ impl<'a, G: Grammar> Context<'a, G> {
     ///
     /// // Pop up a message in the editor (`MessageType` 3 is "info").
     /// fn announce<G: Grammar>(cx: &mut Context<'_, G>) -> Result<(), Error> {
-    ///     cx.notify("window/showMessage", &json!({ "type": 3, "message": "Indexing done" }))
+    ///     cx.notify("window/showMessage", json!({ "type": 3, "message": "Indexing done" }))
     /// }
     /// ```
-    pub fn notify<P: Serialize + ?Sized>(&mut self, method: &str, params: &P) -> Result<(), Error> {
-        self.wire.outbox.notify(method, params)
+    pub fn notify<'p>(&mut self, method: &str, params: impl Into<Json<'p>>) -> Result<(), Error> {
+        self.wire.peer.notify(method, params).map_err(Error::from)
     }
 
     /// Sends a request to the client and returns the id it was sent with.
     ///
     /// The client's answer arrives later, as a call to
     /// [`Handler::response`](crate::Handler::response) with the same id; keep
-    /// the id to tell answers apart. Ids are assigned from a counter starting at
-    /// 0 for each session. The server remembers which ids are awaiting an
-    /// answer and delivers exactly one answer for each; anything else that
-    /// looks like a response is logged and dropped.
+    /// the id to tell answers apart. Ids count up from 1 for each session. The
+    /// server delivers exactly one outcome for each request.
     ///
     /// At most 1024 requests await an answer at once. Sending one more cancels
     /// the oldest outstanding request: the server sends the client
-    /// `$/cancelRequest` for it and, once the current handler call returns,
-    /// delivers [`REQUEST_CANCELLED`](crate::ResponseError::REQUEST_CANCELLED)
-    /// as its answer. An answer the client sends for it afterwards is logged
-    /// and dropped, so each request is still answered exactly once.
+    /// `$/cancelRequest` for it and delivers
+    /// [`REQUEST_CANCELLED`](crate::ResponseError::REQUEST_CANCELLED) as its
+    /// answer once the current handler call returns. An answer the client
+    /// sends for it afterwards is dropped.
+    ///
+    /// During `initialize` a request is held and sent right after the
+    /// `initialize` response, in order. If `initialize` fails, the request is
+    /// never sent and its outcome is `REQUEST_CANCELLED`.
     ///
     /// # Errors
     ///
-    /// [`Error::Json`] if `params` fails to serialize. Nothing is sent, and no
-    /// id is used up.
+    /// As [`notify`](Context::notify). Nothing is sent, and no id is used up.
     ///
     /// # Examples
     ///
@@ -226,31 +269,37 @@ impl<'a, G: Grammar> Context<'a, G> {
     ///
     /// // Ask for the user's settings for this language.
     /// fn fetch_settings<G: Grammar>(cx: &mut Context<'_, G>) -> Result<u64, Error> {
-    ///     cx.request("workspace/configuration", &json!({ "items": [{ "section": "lisp" }] }))
+    ///     cx.request("workspace/configuration", json!({ "items": [{ "section": "lisp" }] }))
     /// }
     /// ```
-    pub fn request<P: Serialize + ?Sized>(
-        &mut self,
-        method: &str,
-        params: &P,
-    ) -> Result<u64, Error> {
-        let requests = &mut self.wire.requests;
-        let id = requests.next;
-        self.wire.outbox.request(id, method, params)?;
-        requests.next = id.wrapping_add(1);
-        if let Some(oldest) = requests.issue(id) {
-            // Tell the client to stop working on it; any answer it still
-            // sends is logged and dropped, since the id is no longer pending.
-            self.wire.outbox.cancel(oldest);
-        }
+    pub fn request<'p>(&mut self, method: &str, params: impl Into<Json<'p>>) -> Result<u64, Error> {
+        let call = self.wire.peer.request(method, params)?;
+        let id = call.id();
+        self.wire.calls.push(call);
         Ok(id)
+    }
+
+    /// Sends `window/logMessage`: a line for the client's output log.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsp_lang::incremental_lang::Grammar;
+    /// use lsp_lang::{Context, MessageType};
+    ///
+    /// fn note<G: Grammar>(cx: &mut Context<'_, G>) {
+    ///     cx.log(MessageType::Info, "index rebuilt");
+    /// }
+    /// ```
+    pub fn log(&mut self, kind: MessageType, message: &str) {
+        self.wire.log(kind, message);
     }
 
     /// Publishes `diagnostics` for `document`, replacing whatever was
     /// published for it before.
     ///
-    /// Each [`Diagnostic`]'s spans are byte offsets into the document's text —
-    /// the same space as the syntax tree's spans, and the space a
+    /// Each [`Diagnostic`]'s spans are byte offsets into the document's text,
+    /// the same space as the syntax tree's spans and the space a
     /// `diag_lang::SourceMap` gives a single file added first. They are
     /// converted to ranges in the session encoding (clamped to the text), the
     /// message is joined with the primary label, notes, and help lines, and
@@ -309,18 +358,16 @@ impl<'a, G: Grammar> Context<'a, G> {
     /// }
     /// ```
     pub fn publish_diagnostics(&mut self, document: &Document<G>, diagnostics: &[Diagnostic]) {
-        let Wire {
-            outbox, scratch, ..
-        } = &mut *self.wire;
-        outbox.notify_with("textDocument/publishDiagnostics", |out| {
-            write_publish(out, scratch, document, diagnostics);
-        });
+        let wire = &mut *self.wire;
+        wire.text.clear();
+        write_publish(&mut wire.text, &mut wire.scratch, document, diagnostics);
+        wire.send_text("textDocument/publishDiagnostics");
     }
 
     /// Clears the diagnostics published for `uri`.
     ///
-    /// Works whether or not the document is open — the usual call is on
-    /// close, which is what the default
+    /// Works whether or not the document is open; the usual call is on close,
+    /// which is what the default
     /// [`Handler::closed`](crate::Handler::closed) does.
     ///
     /// # Examples
@@ -338,11 +385,10 @@ impl<'a, G: Grammar> Context<'a, G> {
     /// }
     /// ```
     pub fn clear_diagnostics(&mut self, uri: &str) {
-        self.wire
-            .outbox
-            .notify_with("textDocument/publishDiagnostics", |out| {
-                write_clear(out, uri)
-            });
+        let wire = &mut *self.wire;
+        wire.text.clear();
+        write_clear(&mut wire.text, uri);
+        wire.send_text("textDocument/publishDiagnostics");
     }
 }
 
@@ -350,55 +396,7 @@ impl<G: Grammar> fmt::Debug for Context<'_, G> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Context")
             .field("documents", &self.workspace.len())
-            .field("next_id", &self.wire.requests.next)
+            .field("outstanding_requests", &self.wire.calls.len())
             .finish_non_exhaustive()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_requests_settle_each_id_once() {
-        let mut requests = Requests::default();
-        for id in 0..3 {
-            assert_eq!(requests.issue(id), None);
-        }
-        assert!(requests.settle(1));
-        assert!(!requests.settle(1), "a second answer is refused");
-        assert!(!requests.settle(99), "an id never issued is refused");
-        assert_eq!(requests.outstanding(), 2);
-    }
-
-    #[test]
-    fn test_requests_at_the_cap_cancel_the_oldest() {
-        let mut requests = Requests::default();
-        let cap = MAX_PENDING_REQUESTS as u64;
-        for id in 0..cap {
-            assert_eq!(requests.issue(id), None);
-        }
-        // Answering one makes room without cancelling anything.
-        assert!(requests.settle(5));
-        assert_eq!(requests.issue(cap), None);
-        // Now full again: each new request cancels the oldest still waiting.
-        assert_eq!(requests.issue(cap + 1), Some(0));
-        assert_eq!(requests.issue(cap + 2), Some(1));
-        assert_eq!(requests.outstanding(), MAX_PENDING_REQUESTS);
-        assert_eq!(requests.take_cancelled(), [0, 1]);
-        assert!(requests.take_cancelled().is_empty());
-        assert!(!requests.settle(0), "a cancelled request takes no answer");
-        assert!(requests.settle(cap + 2));
-    }
-
-    #[test]
-    fn test_requests_forget_clears_everything_but_the_counter() {
-        let mut requests = Requests::default();
-        for id in 0..=MAX_PENDING_REQUESTS as u64 {
-            let _cancelled = requests.issue(id);
-        }
-        requests.forget();
-        assert_eq!(requests.outstanding(), 0);
-        assert!(requests.take_cancelled().is_empty());
     }
 }

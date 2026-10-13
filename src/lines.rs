@@ -19,8 +19,6 @@
 //! (every non-continuation byte begins a scalar value; every 4-byte lead adds a
 //! surrogate), which the compiler vectorizes.
 
-use memchr::memchr2_iter;
-
 use crate::position::{Encoding, Position};
 
 /// Byte offsets at which each line starts. `starts[0]` is always `0`, so the
@@ -186,7 +184,7 @@ fn floor_boundary(text: &str, offset: u32) -> usize {
 
 /// Width of `prefix` (valid UTF-8 on character boundaries) in `encoding`.
 #[inline]
-fn width(prefix: &[u8], encoding: Encoding) -> u32 {
+pub(crate) fn width(prefix: &[u8], encoding: Encoding) -> u32 {
     match encoding {
         Encoding::Utf8 => prefix.len() as u32,
         Encoding::Utf16 => utf16_len(prefix),
@@ -199,7 +197,7 @@ fn width(prefix: &[u8], encoding: Encoding) -> u32 {
 /// `\r\n` test may read the byte just past `to`, which is what the line-break
 /// rule asks for.
 fn breaks(bytes: &[u8], from: usize, to: usize) -> impl Iterator<Item = u32> + '_ {
-    memchr2_iter(b'\n', b'\r', &bytes[from..to]).filter_map(move |i| {
+    BreakBytes::new(&bytes[from..to]).filter_map(move |i| {
         let p = from + i;
         if bytes[p] == b'\r' && bytes.get(p + 1) == Some(&b'\n') {
             None
@@ -207,6 +205,67 @@ fn breaks(bytes: &[u8], from: usize, to: usize) -> impl Iterator<Item = u32> + '
             Some((p + 1) as u32)
         }
     })
+}
+
+/// The index of the first line-break byte (`\n` or `\r`) of `bytes`.
+pub(crate) fn find_line_break(bytes: &[u8]) -> Option<usize> {
+    BreakBytes::new(bytes).next()
+}
+
+/// The indexes of the `\n` and `\r` bytes of a slice, in order.
+///
+/// Source text is mostly bytes that are not line breaks, so the scan looks at
+/// eight bytes per step: a word has a break byte exactly when one of its bytes
+/// XORed with `\n` (or `\r`) is zero, which the classic "has a zero byte" bit
+/// trick answers for the whole word at once. Only a word that has one is
+/// examined byte by byte. This is plain safe Rust; the word test compiles to
+/// a handful of instructions.
+struct BreakBytes<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> BreakBytes<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+}
+
+/// Whether any byte of `word` is zero. Exact as a yes/no answer: the borrow
+/// the subtraction can carry upward only appears above a byte that is itself
+/// zero.
+#[inline]
+const fn has_zero_byte(word: u64) -> bool {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    (word.wrapping_sub(LOW) & !word & HIGH) != 0
+}
+
+impl Iterator for BreakBytes<'_> {
+    type Item = usize;
+
+    fn next(&mut self) -> Option<usize> {
+        const LF: u64 = 0x0A0A_0A0A_0A0A_0A0A;
+        const CR: u64 = 0x0D0D_0D0D_0D0D_0D0D;
+        let rest = self.bytes.get(self.at..)?;
+        let mut offset = 0;
+        for chunk in rest.chunks_exact(8) {
+            let word = chunk
+                .first_chunk::<8>()
+                .map_or(0, |b| u64::from_le_bytes(*b));
+            if has_zero_byte(word ^ LF) || has_zero_byte(word ^ CR) {
+                break;
+            }
+            offset += 8;
+        }
+        let found = rest
+            .get(offset..)?
+            .iter()
+            .position(|&b| b == b'\n' || b == b'\r')?;
+        let index = self.at + offset + found;
+        self.at = index + 1;
+        Some(index)
+    }
 }
 
 /// End of a line's content: `next` (the start of the following line) less the
@@ -285,6 +344,28 @@ mod tests {
     }
 
     const ALL: [Encoding; 2] = [Encoding::Utf8, Encoding::Utf16];
+
+    #[test]
+    fn test_break_bytes_finds_every_break_at_every_alignment() {
+        // A break at each position of a run, so every lane of the word test and
+        // the remainder path are exercised.
+        for len in 0..40usize {
+            for at in 0..len {
+                for byte in *b"\n\r" {
+                    let mut bytes = vec![b'x'; len];
+                    bytes[at] = byte;
+                    let found: Vec<usize> = BreakBytes::new(&bytes).collect();
+                    assert_eq!(found, vec![at], "len {len}, at {at}");
+                }
+            }
+        }
+        let all: Vec<usize> = BreakBytes::new(b"\n\r\n\rabcdefghij\n").collect();
+        assert_eq!(all, vec![0, 1, 2, 3, 14]);
+        assert_eq!(BreakBytes::new(b"").count(), 0);
+        // Bytes near the break values must not match.
+        let near = [0x0B, 0x0C, 0x0E, 0x8A, 0x8D, 0x0B, 0x0C, 0x0E, 0x8A, 0x8D];
+        assert_eq!(BreakBytes::new(&near).count(), 0);
+    }
 
     #[test]
     fn test_index_new_empty_text_has_one_line() {

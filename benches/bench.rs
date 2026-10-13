@@ -8,31 +8,31 @@
 //!   conversion, incremental reparse, line-index patch.
 //! - `publish/*` — a keystroke whose handler publishes the given number of
 //!   diagnostics, measuring the diag-lang to protocol conversion.
-//! - `request/hover` — a request round trip: parameters parsed into a
-//!   borrowing struct, positions converted to offsets and back, a range
-//!   replied.
+//! - `request/hover` — a request round trip: parameters read, positions
+//!   converted to offsets and back, a range replied.
+//! - `request/semantic_tokens`, `request/document_symbols`,
+//!   `request/completion` — the typed features over a 10,000-line document,
+//!   from the request to the written answer.
 //!
 //! Only the measured messages are timed. The input stream is split in three —
 //! setup (`initialize`, and `didOpen` for the per-message benchmarks), the
 //! measured messages, and `shutdown`/`exit` — and notes the instant the server
-//! first asks for each part's bytes. The server reads a message's header only
-//! after it has handled the previous message, so those instants bracket the
-//! measured messages exactly, leaving out setup and the session's teardown.
+//! first asks for each part's bytes. The server reads only when it has handled
+//! and run everything it was given, so those instants bracket the measured
+//! messages exactly, leaving out setup and the session's teardown.
 
 #[path = "../examples/common/mod.rs"]
 mod common;
 
 use std::hint::black_box;
-use std::io::{self, BufRead, Read};
+use std::io::{self, Read};
 use std::time::{Duration, Instant};
 
-use common::{Client, Lisp, PositionParams};
+use common::{Client, Lisp, LispServer};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use lsp_lang::diag_lang::{Label, Severity};
 use lsp_lang::incremental_lang::Span;
-use lsp_lang::{
-    Context, Diagnostic, Document, Handler, Json, Position, Reply, ResponseError, Server,
-};
+use lsp_lang::{Context, Diagnostic, Document, Features, Handler, Position, ResponseError, Server};
 
 const URI: &str = "file:///bench.lisp";
 
@@ -99,8 +99,8 @@ struct Split<'a> {
     entered: [Option<Instant>; 3],
 }
 
-impl BufRead for Split<'_> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+impl Read for Split<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         while self.parts[self.current].is_empty() && self.current < 2 {
             self.current += 1;
         }
@@ -108,21 +108,11 @@ impl BufRead for Split<'_> {
         if entered.is_none() {
             *entered = Some(Instant::now());
         }
-        Ok(self.parts[self.current])
-    }
-
-    fn consume(&mut self, n: usize) {
+        // Never crosses into the next part: a read ends where a part does.
         let part = &mut self.parts[self.current];
+        let n = part.len().min(buf.len());
+        buf[..n].copy_from_slice(&part[..n]);
         *part = &part[n..];
-    }
-}
-
-impl Read for Split<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let available = self.fill_buf()?;
-        let n = available.len().min(buf.len());
-        buf[..n].copy_from_slice(&available[..n]);
-        self.consume(n);
         Ok(n)
     }
 }
@@ -158,21 +148,23 @@ impl Handler<Lisp> for Publisher {
 }
 
 /// Answers hover with the range from the start of the line to the cursor.
-struct Hover;
-impl Handler<Lisp> for Hover {
-    fn request(
+struct Hovering;
+impl Handler<Lisp> for Hovering {
+    fn features(&self) -> Features {
+        Features::new().hover()
+    }
+
+    fn hover(
         &mut self,
-        _: &str,
-        params: Json<'_>,
-        cx: &mut Context<'_, Lisp>,
-    ) -> Result<Reply, ResponseError> {
-        let p: PositionParams<'_> = params.parse()?;
-        let Some(doc) = cx.document(p.text_document.uri) else {
-            return Ok(Reply::null());
-        };
-        let at = doc.offset(p.position);
-        let line_start = doc.offset(Position::new(p.position.line, 0));
-        Ok(Reply::new(&doc.range(Span::new(line_start, at)))?)
+        doc: &Document<Lisp>,
+        at: Position,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<Option<lsp_lang::Hover>, ResponseError> {
+        let cursor = doc.offset(at);
+        let line_start = doc.offset(Position::new(at.line, 0));
+        Ok(Some(
+            lsp_lang::Hover::plain_text("").with_range(doc.range(Span::new(line_start, cursor))),
+        ))
     }
 }
 
@@ -269,9 +261,42 @@ fn bench_request(c: &mut Criterion) {
                     c.at("textDocument/hover", URI, (k % 9_000) as u32, 21);
                 }
             });
-            measure(Hover, &setup, &measured)
+            measure(Hovering, &setup, &measured)
         });
     });
+}
+
+/// The typed features of the Lisp server over a 10,000-line document: each
+/// request is parsed, answered from the cached analysis, and written.
+fn bench_features(c: &mut Criterion) {
+    let setup = setup(Some(&document(10_000)));
+    let mut group = c.benchmark_group("request");
+    for (name, method) in [
+        ("semantic_tokens", "textDocument/semanticTokens/full"),
+        ("document_symbols", "textDocument/documentSymbol"),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_custom(|iters| {
+                let measured = timed(|c| {
+                    for _ in 0..iters {
+                        c.of(method, URI);
+                    }
+                });
+                measure(LispServer::default(), &setup, &measured)
+            });
+        });
+    }
+    group.bench_function("completion", |b| {
+        b.iter_custom(|iters| {
+            let measured = timed(|c| {
+                for k in 0..iters {
+                    c.at("textDocument/completion", URI, (k % 9_000) as u32, 1);
+                }
+            });
+            measure(LispServer::default(), &setup, &measured)
+        });
+    });
+    group.finish();
 }
 
 criterion_group!(
@@ -279,6 +304,7 @@ criterion_group!(
     bench_open,
     bench_keystroke,
     bench_publish,
-    bench_request
+    bench_request,
+    bench_features
 );
 criterion_main!(benches);

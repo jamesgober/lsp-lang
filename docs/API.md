@@ -1,9 +1,11 @@
 # lsp-lang &mdash; API Reference
 
 > Complete reference for every public item in `lsp-lang`, with examples.
-> **Status: stable (1.0).** The surface below is the `1.0` contract; it follows
+> **Status: 2.0.** The surface below is the `2.0` contract; it follows
 > [Semantic Versioning](#stability) and will not change in a breaking way before
-> `2.0`. See [`../dev/ROADMAP.md`](../dev/ROADMAP.md).
+> `3.0`. See [`../dev/ROADMAP.md`](../dev/ROADMAP.md), and the
+> [migration table](../CHANGELOG.md#migrating-from-1x) for code written
+> against `1.x`.
 
 <sub>Copyright &copy; 2026 <strong>James Gober</strong>.</sub>
 
@@ -14,54 +16,51 @@
 - [Quick start](#quick-start)
 - [Concepts](#concepts)
   - [The session lifecycle](#the-session-lifecycle)
+  - [Features and capabilities](#features-and-capabilities)
   - [Document synchronization](#document-synchronization)
   - [Positions and encodings](#positions-and-encodings)
-  - [Diagnostics](#diagnostics-mapping)
+  - [Diagnostics mapping](#diagnostics-mapping)
+  - [Cancellation](#cancellation)
   - [Three kinds of failure](#three-kinds-of-failure)
   - [Threading and performance](#threading-and-performance)
   - [About the examples](#about-the-examples)
 - [`Server`](#server)
   - [`Server::new`](#servernew)
   - [`Server::with_message_limit`](#serverwith_message_limit)
+  - [`Server::with_info`](#serverwith_info)
+  - [`Server::custom_request`](#servercustom_request), [`Server::custom_notification`](#servercustom_notification)
   - [`Server::handler`](#serverhandler)
   - [`Server::run`](#serverrun)
+- [`serve_stdio`](#serve_stdio)
 - [`Handler`](#handler)
   - [`Handler::initialize`](#handlerinitialize)
+  - [`Handler::features`](#handlerfeatures)
   - [`Handler::changed`](#handlerchanged)
   - [`Handler::closed`](#handlerclosed)
+  - [`Handler::hover`](#handlerhover)
+  - [`Handler::definition`](#handlerdefinition)
+  - [`Handler::completion`](#handlercompletion)
+  - [`Handler::document_symbols`](#handlerdocument_symbols)
+  - [`Handler::semantic_tokens`](#handlersemantic_tokens)
   - [`Handler::request`](#handlerrequest)
   - [`Handler::notification`](#handlernotification)
   - [`Handler::response`](#handlerresponse)
+- [`Features`](#features)
 - [`Context`](#context)
-  - [`Context::document`](#contextdocument)
-  - [`Context::documents`](#contextdocuments)
-  - [`Context::notify`](#contextnotify)
-  - [`Context::request`](#contextrequest)
-  - [`Context::publish_diagnostics`](#contextpublish_diagnostics)
-  - [`Context::clear_diagnostics`](#contextclear_diagnostics)
+  - [`Context::document`](#contextdocument), [`Context::documents`](#contextdocuments)
+  - [`Context::notify`](#contextnotify), [`Context::request`](#contextrequest)
+  - [`Context::log`](#contextlog), [`MessageType`](#messagetype)
+  - [`Context::publish_diagnostics`](#contextpublish_diagnostics), [`Context::clear_diagnostics`](#contextclear_diagnostics)
 - [`Document`](#document)
-  - [`Document::uri`](#documenturi)
-  - [`Document::version`](#documentversion)
-  - [`Document::text`](#documenttext)
-  - [`Document::tree`](#documenttree)
-  - [`Document::incremental`](#documentincremental)
-  - [`Document::encoding`](#documentencoding)
-  - [`Document::position`](#documentposition)
-  - [`Document::offset`](#documentoffset)
-  - [`Document::range`](#documentrange)
-  - [`Document::span`](#documentspan)
-- [`Json`](#json)
-  - [`Json::from_raw`](#jsonfrom_raw)
-  - [`Json::parse`](#jsonparse)
-  - [`Json::as_str`](#jsonas_str)
-- [`Reply`](#reply)
-  - [`Reply::new`](#replynew)
-  - [`Reply::null`](#replynull)
-  - [`Reply::as_str`](#replyas_str)
+- [Positions: `Position`, `Range`, `Encoding`](#positions-position-range-encoding)
+- [Results: `Location`, `Hover`, `MarkupKind`, `TextEdit`](#results-location-hover-markupkind-textedit)
+- [`CompletionItem`, `CompletionItemKind`](#completionitem-completionitemkind)
+- [`DocumentSymbol`, `SymbolKind`](#documentsymbol-symbolkind)
+- [Semantic tokens](#semantic-tokens)
+  - [`SemanticTokensLegend`](#semantictokenslegend)
+  - [`SemanticTokens`](#semantictokens)
+  - [`SemanticTokensBuilder`](#semantictokensbuilder)
 - [`ResponseError`](#responseerror)
-- [`Position`](#position)
-- [`Range`](#range)
-- [`Encoding`](#encoding)
 - [`Error`](#error)
 - [Re-exports](#re-exports)
 - [Stability](#stability)
@@ -73,39 +72,44 @@ language server built on it supplies two things:
 
 1. an [`incremental_lang::Grammar`](https://docs.rs/incremental-lang), which
    parses each open document and says which nodes may be reparsed on their own;
-2. a [`Handler`](#handler), which answers the requests the language supports
-   and publishes diagnostics as documents change.
+2. a [`Handler`](#handler), which publishes diagnostics as documents change and
+   answers the requests the language supports.
 
 The [`Server`](#server) does everything else: it frames and parses JSON-RPC
-messages, runs the `initialize`/`shutdown`/`exit` lifecycle, keeps every open
-document in step with the editor (reparsing incrementally on each edit), and
-converts between protocol positions and byte offsets. Handlers work in byte
-offsets and byte spans, like the rest of the family, and convert at the edge
-with a [`Document`](#document).
+messages ([`rpc-io`](https://docs.rs/rpc-io), over [`jsonx-lib`](https://docs.rs/jsonx-lib)),
+runs the `initialize`/`shutdown`/`exit` lifecycle, keeps every open document in
+step with the editor (reparsing incrementally on each edit), cancels requests
+the client no longer wants, and converts between protocol positions and byte
+offsets. Handlers work in byte offsets and byte spans, like the rest of the
+family, and convert at the edge with a [`Document`](#document). There are no
+third-party dependencies.
 
 | Item | Kind | Role |
 |---|---|---|
-| [`Server`](#server) | struct | The protocol engine: reads, dispatches, writes. |
+| [`Server`](#server), [`serve_stdio`](#serve_stdio) | struct, fn | The protocol engine: reads, dispatches, writes. |
 | [`Handler`](#handler) | trait | The language's behaviour; every method has a default. |
-| [`Context`](#context) | struct | A handler's view of the session: documents and a channel to the client. |
+| [`Features`](#features) | struct | What a handler offers; capabilities are advertised from it. |
+| [`Context`](#context), [`MessageType`](#messagetype) | struct, enum | A handler's view of the session: documents and a channel to the client. |
 | [`Document`](#document) | struct | An open file: text, syntax tree, position conversion. |
-| [`Json`](#json) | struct | Incoming parameters or results, parsed on demand. |
-| [`Reply`](#reply) | struct | A request's result, pre-serialized. |
+| [`Position`, `Range`, `Encoding`](#positions-position-range-encoding) | structs, enum | The protocol's coordinates and the unit of a column. |
+| [`Location`, `Hover`, `MarkupKind`, `TextEdit`](#results-location-hover-markupkind-textedit) | structs, enum | Results the typed features return. |
+| [`CompletionItem`, `CompletionItemKind`](#completionitem-completionitemkind) | struct, enum | Completion. |
+| [`DocumentSymbol`, `SymbolKind`](#documentsymbol-symbolkind) | struct, enum | The outline, as a tree. |
+| [`SemanticTokensLegend`, `SemanticTokens`, `SemanticTokensBuilder`](#semantic-tokens) | structs | Highlighting, full and delta. |
 | [`ResponseError`](#responseerror) | struct | A request's failure, with a JSON-RPC error code. |
-| [`Position`](#position), [`Range`](#range) | structs | The protocol's coordinates. |
-| [`Encoding`](#encoding) | enum | The unit columns are counted in. |
 | [`Error`](#error) | enum | What ends a session, or fails a write. |
 
 ## Installation
 
 ```toml
 [dependencies]
-lsp-lang = "1"
+lsp-lang = "2"
 ```
 
-`incremental_lang`, `diag_lang`, and `serde_json` are [re-exported](#re-exports).
-To derive `Deserialize` for parameter types, add `serde` with the `derive`
-feature. MSRV: Rust 1.85 (Rust 2024 edition).
+`incremental_lang`, `diag_lang`, `jsonx_lib`, and `rpc_io` are
+[re-exported](#re-exports), so a server needs no other dependency to write its
+grammar, build diagnostics, read parameters, or name a transport type. MSRV:
+Rust 1.85 (Rust 2024 edition).
 
 ## Quick start
 
@@ -130,9 +134,8 @@ A server binary is a grammar, a handler, and one call:
 #         b.finish();
 #     }
 # }
-use std::io;
 use std::process::ExitCode;
-use lsp_lang::{Context, Document, Handler, Server};
+use lsp_lang::{Context, Document, Handler};
 
 struct MyServer;
 
@@ -144,8 +147,7 @@ impl Handler<MyGrammar> for MyServer {
 }
 
 fn main() -> ExitCode {
-    let mut server = Server::new(MyGrammar, MyServer);
-    match server.run(io::stdin().lock(), io::stdout().lock()) {
+    match lsp_lang::serve_stdio(MyGrammar, MyServer) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("language server stopped: {err}");
@@ -155,9 +157,31 @@ fn main() -> ExitCode {
 }
 ```
 
+Add features by listing them and overriding their methods:
+
+```rust
+# use lsp_lang::incremental_lang::Grammar;
+use lsp_lang::{Context, Document, Features, Handler, Hover, Position, ResponseError};
+
+struct Lines;
+
+impl<G: Grammar> Handler<G> for Lines {
+    fn features(&self) -> Features {
+        Features::new().hover()
+    }
+
+    fn hover(&mut self, doc: &Document<G>, at: Position, _: &mut Context<'_, G>)
+        -> Result<Option<Hover>, ResponseError>
+    {
+        let line = doc.text().lines().nth(at.line as usize).unwrap_or("");
+        Ok(Some(Hover::markdown(format!("`{line}`"))))
+    }
+}
+```
+
 The [README](../README.md#quick-start) has a complete, runnable session, and
-the [examples](../examples) a full server with diagnostics, hover, and
-go-to-definition.
+the [examples](../examples) a full server with diagnostics, hover,
+go-to-definition, completion, an outline, and semantic tokens.
 
 ## Concepts
 
@@ -170,33 +194,62 @@ inside the session window:
 | Phase | Requests | Notifications |
 |---|---|---|
 | Before `initialize` | `initialize` is handled; anything else is refused with `ServerNotInitialized` (`-32002`). | Dropped, except `exit`. |
-| Running | `initialize` again is refused with `InvalidRequest`; `shutdown` moves to the next phase; everything else goes to [`Handler::request`](#handlerrequest). | Document sync is handled by the server; `exit` ends the session; everything else goes to [`Handler::notification`](#handlernotification). |
-| After `shutdown` | Refused with `InvalidRequest` (`-32600`). | Dropped, except `exit`. |
+| Running | `initialize` again is refused with `InvalidRequest`; `shutdown` moves to the next phase; the listed [features](#features-and-capabilities) and registered [custom requests](#servercustom_request) go to the handler; any other method is `MethodNotFound`. | Document sync is handled by the server; `exit` ends the session; the standard and [registered](#servercustom_notification) notifications go to [`Handler::notification`](#handlernotification); any other is ignored. |
+| After `shutdown` | Refused with `InvalidRequest` (`-32600`); a method the server does not know is still `MethodNotFound`. | Dropped, except `exit`. |
 
 `exit` ends [`run`](#serverrun): with `Ok(())` after `shutdown`, or
 [`Error::ExitWithoutShutdown`](#error) before it, mirroring the exit codes 0
-and 1 the protocol asks for.
+and 1 the protocol asks for. A failed `initialize` leaves the session
+uninitialized, and the client may send it again.
 
 A message is classified by its members. With a `method` and an `id` it is a
-request; the id must be a string or an integer, and a request with any other
-id (`null`, a fraction, an object) is refused with `InvalidRequest` under a
-`null` id, without being dispatched. A request whose envelope cannot be read
-(a `method` that is not a string, say) but whose `id` is a string or an
-integer is refused with `InvalidRequest` under that id. With a `method` and no
-`id` it is a
-notification. Without a `method` it is the client's answer to one of the
+request; the id must be a string or an integer, and a request with any other id
+(`null`, a fraction, an object) is refused with `InvalidRequest` under a `null`
+id, without being dispatched. A request whose envelope cannot be read (a
+`method` that is not a string, say) but whose `id` is a string or an integer is
+refused with `InvalidRequest` under that id. With a `method` and no `id` it is
+a notification. Without a `method` it is the client's answer to one of the
 server's own requests ([`Context::request`](#contextrequest)): it reaches
 [`Handler::response`](#handlerresponse) if, and only if, it answers a request
-still awaiting an answer, whatever the phase; anything else that looks like an
-answer is logged and dropped. The server never replies to an answer.
+still awaiting an answer; anything else that looks like an answer is logged
+and dropped. The server never replies to an answer. `params` must be an array
+or an object (or absent, or `null`), as JSON-RPC requires; a batch of messages
+is answered with one array of answers.
 
 During `initialize`, the server negotiates the [position encoding](#encoding),
-asks [`Handler::initialize`](#handlerinitialize) for the language's
-capabilities, and adds the two it owns: `positionEncoding` and
-`textDocumentSync` (open/close notifications, incremental changes). The
+calls [`Handler::initialize`](#handlerinitialize), asks the handler for its
+[`features`](#handlerfeatures), and answers with the capabilities they imply
+plus the two it owns: `positionEncoding` and `textDocumentSync`. The
 `initialize` response is the first message the client receives: whatever the
 handler sends while answering is held back and follows it. If `initialize`
-fails, that held-back output is discarded.
+fails, that held-back output is discarded, and a request among it is never sent
+(its outcome is `REQUEST_CANCELLED`, delivered to
+[`Handler::response`](#handlerresponse)).
+
+### Features and capabilities
+
+The typed requests are [`hover`](#handlerhover), [`definition`](#handlerdefinition),
+[`completion`](#handlercompletion), [`document_symbols`](#handlerdocument_symbols),
+and [`semantic_tokens`](#handlersemantic_tokens). A handler offers one in two
+steps: override the method, and list the feature in
+[`Handler::features`](#handlerfeatures) with the [`Features`](#features)
+builder. The server then
+
+- advertises exactly the listed features as capabilities in the `initialize`
+  result (hover is `hoverProvider`, completion carries its trigger characters,
+  semantic tokens carry their legend and `full: { delta: true }`);
+- reads the request's parameters, finds the document, calls the method, and
+  writes the answer;
+- answers a request for a feature that is not listed with `MethodNotFound`,
+  even if the method is overridden, because the client was never told it exists;
+- answers a listed feature whose method was not overridden with `MethodNotFound`
+  from the method's default.
+
+A request for a document the client does not have open is answered `null`
+without calling the handler. Malformed parameters are answered
+`InvalidParams`. Features that depend on what the client announced can be
+decided in [`initialize`](#handlerinitialize), since `features` is called after
+it.
 
 ### Document synchronization
 
@@ -215,12 +268,12 @@ failed:
 |---|---|
 | The incremental reparse of an edit failed: the grammar panicked, or its lexer broke its contract, on the reparsed fragment | Applies the same edit again by splicing it into the text and parsing the whole result, logs a warning naming the fault, and carries on: `changed` is called as usual. The document's incremental statistics start over. |
 | The grammar also fails on the whole new text, or the text would outgrow 4 GiB | Keeps the document at its last good state and marks it **out of step**; logs an error (grammar) or warning (size). |
-| An edit's range names a line the document does not have — more than one past its last line | Out of step, logged as a warning. The line just past the last is accepted and means the end of the text; a column past the end of its line is clamped, as the protocol prescribes. |
+| An edit's range names a line the document does not have: more than one past its last line | Out of step, logged as a warning. The line just past the last is accepted and means the end of the text; a column past the end of its line is clamped, as the protocol prescribes. |
 | A change with only ranged edits carries a version no greater than the document's | Out of step, logged as a warning: versions only increase, so the change repeats one already applied or follows one that went missing. |
 
 A `didChange` is all or nothing: if any of its edits fails, the document goes
-back to the text it had before the first (its last good state), and its
-version stays the last one applied.
+back to the text it had before the first (its last good state), and its version
+stays the last one applied.
 
 A document out of step stays open, with the last good text, tree, and version,
 for handlers to read; `changed` is not called and `closed` is not called. The
@@ -229,24 +282,23 @@ when the client next sends it:
 
 - **a whole-text change** (a content change without a range) is applied
   whatever state the document is in, whatever its version, and brings it back
-  in step; edits after it in the same `didChange` apply on top of it, and
-  edits before it are superseded;
+  in step; edits after it in the same `didChange` apply on top of it, and edits
+  before it are superseded;
 - **a reopen** (`didOpen` for the same URI) replaces it.
 
 Ranged changes to an out-of-step document are logged as warnings and ignored.
 A `didOpen` that fails (the grammar fails on the text, or it is over 4 GiB) is
 logged as an error; a document already open under that URI is kept, out of
-step, and otherwise the URI is remembered so a whole-text change can still
-open it. Changes to any other document that is not open are logged and
-ignored.
+step, and otherwise the URI is remembered so a whole-text change can still open
+it. Changes to any other document that is not open are logged and ignored.
 
 A grammar panic costs at most the document's freshness, never the session: the
-server catches it where panics unwind. (A binary built with
-`panic = "abort"` ends instead, as that setting asks.)
+server catches it where panics unwind. (A binary built with `panic = "abort"`
+ends instead, as that setting asks.)
 
 The parsing work of an edit is proportional to the edit. What stays linear in
 the size of the document is cheap: moving the text after the edit (one
-`memmove`) and shifting the line starts after it (one vectorized pass).
+`memmove`) and shifting the line starts after it (one pass over integers).
 
 ### Positions and encodings
 
@@ -254,28 +306,28 @@ The protocol's `Position` is a zero-based line and a column; lines end at
 `\n`, `\r\n`, or a lone `\r`. The column's unit is negotiated: the client lists
 the encodings it supports in `general.positionEncodings`, and the server picks
 **UTF-8** whenever it is offered (a byte column converts to a byte offset
-without scanning) and otherwise the protocol's mandatory **UTF-16**. A
-[`Document`](#document) converts in the negotiated encoding, so a handler never
-counts columns itself.
+without scanning) and otherwise the protocol's mandatory **UTF-16**. UTF-32 is
+not negotiated. A [`Document`](#document) converts in the negotiated encoding,
+so a handler never counts columns itself.
 
 Conversions are total. Input the protocol considers out of range is clamped as
 the protocol prescribes: a line past the last maps to the end of the text, a
 column past the end of its line maps to the end of that line (before the line
-break). A column inside a character — between the halves of a UTF-16 surrogate
-pair, or inside a UTF-8 sequence — maps to that character's start. Byte offsets
+break). A column inside a character (between the halves of a UTF-16 surrogate
+pair, or inside a UTF-8 sequence) maps to that character's start. Byte offsets
 past the end clamp to the end, and offsets inside a character map to it.
 
 Every byte offset that is a caret position round-trips exactly through
-[`position`](#documentposition) and [`offset`](#documentoffset). The one
-offset that is not — between the `\r` and `\n` of one line break — maps to the
-column just past the `\r`, which converts back to the `\r` itself.
+[`position`](#documentposition) and [`offset`](#documentoffset). The one offset
+that is not, between the `\r` and `\n` of one line break, maps to the column
+just past the `\r`, which converts back to the `\r` itself.
 
 ### Diagnostics mapping
 
 [`Context::publish_diagnostics`](#contextpublish_diagnostics) converts
 [`diag_lang::Diagnostic`](https://docs.rs/diag-lang)s whose spans are byte
-offsets into the document — the space the syntax tree's spans are in — and
-writes `textDocument/publishDiagnostics` with the document's URI and version:
+offsets into the document (the space the syntax tree's spans are in) and writes
+`textDocument/publishDiagnostics` with the document's URI and version:
 
 | diag-lang | Protocol |
 |---|---|
@@ -290,17 +342,45 @@ writes `textDocument/publishDiagnostics` with the document's URI and version:
 | help lines | `message`, one line each: `help: …` |
 | secondary labels | `relatedInformation`: one entry each, located in the same document, with the label's text (or the headline, if the label has none) |
 
+### Cancellation
+
+`$/cancelRequest` cancels a request that has been received and has not started.
+The transport answers a cancelled request with `RequestCancelled` (`-32800`) the
+moment the cancellation is read, exactly once, and the handler is never called
+for it; a cancellation for a request that already finished, or for an id nobody
+sent, is ignored.
+
+The server queues every request and notification it receives and runs the queue
+when its input has nothing more buffered, in arrival order. A cancellation that
+arrives with the request it names, or behind it in the same read (the usual
+case for a request queued behind a slow one), is therefore applied before the
+request runs. The one exception to queueing is `initialize`, which is run at
+once, because the client may pipeline messages behind it.
+
+A handler that is already running is **not interrupted**: the server is
+single-threaded, so it cannot read the cancellation until the handler returns.
+A handler with slow work should keep each call short, or do the work on a worker
+thread from a snapshot of the tree (which is `O(1)` to take), and report back on
+a later call.
+
+Server-to-client requests ([`Context::request`](#contextrequest)) are the other
+direction: when more than 1024 are outstanding, the oldest is cancelled with
+`$/cancelRequest` and its outcome is `REQUEST_CANCELLED`.
+
 ### Three kinds of failure
 
 | Kind | Type | Who sees it |
 |---|---|---|
 | A request failed | [`ResponseError`](#responseerror) | The client, as the request's error response. |
 | A notification could not be processed (malformed parameters, an edit that could not be applied, a grammar panic, a change to a document that is not open or is out of step, a handler panic outside a request), or an answer from the client matched no outstanding request | `window/logMessage` | The client's log. Notifications and answers have no response, so this is the only channel. |
-| The session cannot continue (the transport failed or closed, the framing broke, a message was too large, `exit` without `shutdown`) | [`Error`](#error) | The caller of [`run`](#serverrun), which should exit non-zero. |
+| The session cannot continue (the transport failed or closed, the framing broke, `exit` without `shutdown`) | [`Error`](#error) | The caller of [`run`](#serverrun), which should exit non-zero. |
 
 Malformed JSON and messages of the wrong shape are answered with `ParseError`
-(`-32700`) and `InvalidRequest` (`-32600`) and the session continues. Nothing in
-the crate panics on client input.
+(`-32700`) and `InvalidRequest` (`-32600`) and the session continues, as does a
+message over the [size limit](#serverwith_message_limit). Nothing in the crate
+panics on client input; the limits on message size, nesting depth, string
+length, and values per message (see `rpc-io` and `jsonx-lib`) bound what a
+message can cost.
 
 A panic in the handler is contained the same way as one in the grammar, where
 panics unwind. A request whose handler panicked is answered with
@@ -308,52 +388,47 @@ panics unwind. A request whose handler panicked is answered with
 bytes); a panic in any other handler method (`changed`, `closed`,
 `notification`, `response`) is logged as an error. Either way the session
 carries on with the same handler, and messages the handler sent before
-panicking are still sent; the handler's own state is whatever the panic left.
-A panic in `initialize` refuses it with `InternalError`, like an error
-return.
+panicking are still sent; the handler's own state is whatever the panic left. A
+panic in `initialize` or `features` refuses `initialize` with `InternalError`,
+like an error return.
 
 ### Threading and performance
 
-The server is synchronous and single-threaded: it reads one message, handles
-it to completion, writes everything the handler sent with one `write_all` and
-`flush`, then reads the next. For an editor talking to one server over a pipe,
-this is the lowest-latency design — nothing stands between the client and the
-handler. A handler with slow work can clone a document's
+The server is synchronous and single-threaded: it reads, handles each complete
+message, runs the queued work, writes what it produced with one `write_all` and
+`flush` per message or job, then reads again. For an editor talking to one
+server over a pipe this is the lowest-latency design: nothing stands between the
+client and the handler. A handler with slow work can clone a document's
 [tree](#documenttree) (one reference-count increment; `Send + Sync`) for a
 worker thread and report back on a later call.
 
 On the hot path, nothing is built that is not needed. The JSON-RPC envelope is
-parsed in place, borrowing the method name and URIs from the message and
-keeping parameters as raw JSON until the handler reads them; results are
-serialized straight to text; diagnostics are written field by field into the
-outgoing buffer. Message buffers are allocated once per session. An edit
-costs a binary search to convert its range, an incremental reparse, and a
-patch of the line index.
+decoded in place, borrowing the method name and URIs from the message and
+keeping parameters as slices until they are read; results are written straight
+to text (semantic tokens, outlines, and diagnostics never become value trees);
+the output buffer is reused for the whole session. An edit costs a binary
+search to convert its range, an incremental reparse, and a patch of the line
+index.
 
 ### About the examples
 
 Examples that run a whole session start with a few hidden lines (shown as
-`# …` on GitHub): a grammar that reads a whole document as one token, and two
-helpers. `session(text, rest)` builds the input an editor would send —
-`initialize` (id 0), `didOpen` of `file:///a` with `text`, the raw messages in
-`rest`, then `shutdown` (id 99) and `exit`. `replies(output)` splits the
-server's output back into JSON values.
+`# …` on GitHub): a grammar that reads a whole document as one token. Sessions
+are driven from memory: build the framed bytes an editor would send, pass them
+to [`Server::run`](#serverrun) as the input, and read the framed bytes written
+to the output.
 
 ## `Server`
 
 ```rust,ignore
 pub struct Server<G, H> { /* private */ }
-
-impl<G: Grammar + Clone, H: Handler<G>> Server<G, H>
+impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> { /* ... */ }
 ```
 
-The protocol engine around a [`Handler`](#handler). It speaks the base
-protocol (`Content-Length`-framed JSON-RPC) over any `BufRead` and `Write`,
-runs the [lifecycle](#the-session-lifecycle), keeps [documents in
-sync](#document-synchronization), and calls the handler for everything else.
-
-`G` is the grammar every document is parsed with; `H` the handler. `Debug`
-shows the message limit.
+The protocol engine around a [`Handler`](#handler): transport, lifecycle,
+document synchronization, the typed features, and cancellation. `G` is the
+grammar every document is parsed with (cloned per document; a unit struct costs
+nothing). `Debug` shows the message limit.
 
 ### `Server::new`
 
@@ -361,12 +436,7 @@ shows the message limit.
 pub fn new(grammar: G, handler: H) -> Server<G, H>
 ```
 
-Creates a server.
-
-| Parameter | Meaning |
-|---|---|
-| `grammar` | The language's grammar. Each opened document gets its own clone; a grammar is typically a unit struct, so cloning costs nothing. |
-| `handler` | The language server's behaviour. The server owns it; read it back with [`handler`](#serverhandler). |
+Creates a server. The default message limit is 256 MiB.
 
 ```rust
 # use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
@@ -389,40 +459,10 @@ Creates a server.
 # }
 use lsp_lang::{Handler, Server};
 
-// The smallest possible server: document sync, nothing else.
 struct SyncOnly;
 impl Handler<Plain> for SyncOnly {}
 
 let server = Server::new(Plain, SyncOnly);
-```
-
-```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-use lsp_lang::{Handler, Server};
-
-// A handler with state of its own, configured before the session starts.
-struct Linter { max_line: usize }
-impl Handler<Plain> for Linter {}
-
-let server = Server::new(Plain, Linter { max_line: 100 });
-assert_eq!(server.handler().max_line, 100);
 ```
 
 ### `Server::with_message_limit`
@@ -431,15 +471,11 @@ assert_eq!(server.handler().max_line, 100);
 pub fn with_message_limit(self, bytes: usize) -> Server<G, H>
 ```
 
-Sets the largest message body accepted, in bytes. The default is 256 MiB.
-
-| Parameter | Meaning |
-|---|---|
-| `bytes` | The limit. A message that announces a larger `Content-Length` ends the session with [`Error::TooLarge`](#error) before any of its body is read. |
-
-The limit bounds the memory one message can claim. Opening a file sends its
-whole text in one message (JSON-escaped, so somewhat larger than the file), so
-it also bounds the size of document the server accepts.
+Sets the largest message body accepted, and the longest string in a message,
+in bytes. A message announcing a larger body is skipped as it arrives, without
+being buffered, and answered `InvalidRequest` under a `null` id; the session
+goes on. Opening a file sends its whole text in one message (JSON-escaped), so
+the limit caps the size of document the server accepts.
 
 ```rust
 # use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
@@ -464,13 +500,44 @@ it also bounds the size of document the server accepts.
 # impl lsp_lang::Handler<Plain> for SyncOnly {}
 use lsp_lang::{Error, Server};
 
-// Refuse anything over 64 MiB.
-let mut server = Server::new(Plain, SyncOnly).with_message_limit(64 << 20);
-
-let huge = "Content-Length: 99999999999\r\n\r\n";
-let result = server.run(huge.as_bytes(), Vec::new());
-assert!(matches!(result, Err(Error::TooLarge { limit, .. }) if limit == 64 << 20));
+let mut server = Server::new(Plain, SyncOnly).with_message_limit(16);
+let input = "Content-Length: 17\r\n\r\n{\"jsonrpc\":\"2.0\"}";
+let mut output = Vec::new();
+assert!(matches!(server.run(input.as_bytes(), &mut output), Err(Error::Disconnected)));
+assert!(String::from_utf8_lossy(&output).contains("too large"));
 ```
+
+### `Server::with_info`
+
+```rust,ignore
+pub fn with_info(self, name: impl Into<String>, version: impl Into<String>) -> Server<G, H>
+```
+
+Sends `serverInfo` (`name`, `version`) in the `initialize` result.
+
+### `Server::custom_request`
+
+```rust,ignore
+pub fn custom_request(self, method: &str) -> Server<G, H>
+```
+
+Registers a request method the server forwards to
+[`Handler::request`](#handlerrequest), for methods outside the protocol's own
+and the typed features. A request for an unregistered method is
+`MethodNotFound`. A method that is one of the server's own is not affected.
+
+### `Server::custom_notification`
+
+```rust,ignore
+pub fn custom_notification(self, method: &str) -> Server<G, H>
+```
+
+Registers a notification method the server forwards to
+[`Handler::notification`](#handlernotification), beyond the standard ones it
+forwards already: `initialized`, `textDocument/didSave`,
+`textDocument/willSave`, `workspace/didChangeConfiguration`,
+`workspace/didChangeWatchedFiles`, `workspace/didChangeWorkspaceFolders`,
+`$/setTrace`, and `window/workDoneProgress/cancel`.
 
 ### `Server::handler`
 
@@ -478,79 +545,31 @@ assert!(matches!(result, Err(Error::TooLarge { limit, .. }) if limit == 64 << 20
 pub fn handler(&self) -> &H
 ```
 
-Returns the handler — to inspect what it recorded after [`run`](#serverrun)
-returns, in a test for instance.
-
-```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-use lsp_lang::{Context, Document, Handler, Server};
-
-#[derive(Default)]
-struct Versions(Vec<i32>);
-
-impl Handler<Plain> for Versions {
-    fn changed(&mut self, doc: &Document<Plain>, _: &mut Context<'_, Plain>) {
-        self.0.push(doc.version());
-    }
-}
-
-let input = session("hi", &[r#"{"jsonrpc":"2.0","method":"textDocument/didChange","params":
-    {"textDocument":{"uri":"file:///a","version":7},"contentChanges":[{"text":"bye"}]}}"#]);
-let mut server = Server::new(Plain, Versions::default());
-server.run(input.as_bytes(), Vec::new())?;
-assert_eq!(server.handler().0, [1, 7]);
-# Ok::<(), lsp_lang::Error>(())
-```
+The handler, for inspecting what it recorded after [`run`](#serverrun)
+returns, in a test, say.
 
 ### `Server::run`
 
 ```rust,ignore
-pub fn run<R: BufRead, W: Write>(&mut self, input: R, output: W) -> Result<(), Error>
+pub fn run<R: Read, W: Write>(&mut self, input: R, output: W) -> Result<(), Error>
 ```
 
 Serves one session: reads messages from `input` and writes responses and
-notifications to `output` until the client sends `exit`.
+notifications to `output` until the client sends `exit`. `input` need not be
+buffered, and neither `input` nor `output` needs to be `Send` or `'static`: a
+locked stdin and stdout, sockets, or `&[u8]` and `&mut Vec<u8>`. Everything
+sent during one message or one queued job is written with one `write_all` and
+flushed at once; a turn that sends nothing writes nothing.
 
-| Parameter | Meaning |
-|---|---|
-| `input` | The client's messages. Should be buffered; `StdinLock` is. |
-| `output` | Where the server's messages go. Each turn's output is written with one `write_all` and flushed, so it need not be buffered. |
+Each call is a fresh session (uninitialized, no documents open) while the
+grammar and handler carry over. Nothing the client sends and no panic in the
+grammar or handler ends the session; only the transport and the lifecycle do.
 
-Each call is a fresh session — uninitialized, no documents open — while the
-grammar and handler carry over. Nothing the client sends, and no panic in the
-grammar or the handler, ends the session (where panics unwind).
-
-**Errors.** `Ok(())` is a clean stop: `shutdown`, then `exit`. Otherwise one of
-[`Error`](#error)'s session-ending variants: `ExitWithoutShutdown`,
-`Disconnected`, `Io`, `InvalidHeader`, or `TooLarge`. The protocol expects the
-process to exit non-zero in every error case.
+**Errors:** `Ok(())` means a clean stop: `shutdown`, then `exit`. Otherwise
+[`Error::ExitWithoutShutdown`](#error), [`Error::Disconnected`](#error) (the
+input ended before `exit`, possibly mid-message), [`Error::Io`](#error), or
+[`Error::Frame`](#error). Requests received before the failure have been
+answered first.
 
 ```rust
 # use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
@@ -573,13 +592,14 @@ process to exit non-zero in every error case.
 # }
 # struct SyncOnly;
 # impl lsp_lang::Handler<Plain> for SyncOnly {}
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
 use lsp_lang::Server;
 
-// A clean session: initialize, shutdown, exit.
+fn frame(json: &str) -> String {
+    format!("Content-Length: {}\r\n\r\n{json}", json.len())
+}
+
 let input = [
-    frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":
-        {"capabilities":{"general":{"positionEncodings":["utf-8","utf-16"]}}}}"#),
+    frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#),
     frame(r#"{"jsonrpc":"2.0","id":2,"method":"shutdown"}"#),
     frame(r#"{"jsonrpc":"2.0","method":"exit"}"#),
 ]
@@ -587,142 +607,91 @@ let input = [
 
 let mut output = Vec::new();
 Server::new(Plain, SyncOnly).run(input.as_bytes(), &mut output)?;
+
 let output = String::from_utf8(output).unwrap();
-assert!(output.contains(r#""positionEncoding":"utf-8""#));
-assert!(output.contains(r#""textDocumentSync":{"change":2,"openClose":true}"#));
+assert!(output.contains(r#""positionEncoding":"utf-16""#));
+assert!(output.contains(r#"{"jsonrpc":"2.0","id":2,"result":null}"#));
 # Ok::<(), lsp_lang::Error>(())
 ```
 
-```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# struct SyncOnly;
-# impl lsp_lang::Handler<Plain> for SyncOnly {}
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-use lsp_lang::{Error, Server};
+## `serve_stdio`
 
-let mut server = Server::new(Plain, SyncOnly);
-
-// The editor went away without saying goodbye.
-let input = frame(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#);
-assert!(matches!(server.run(input.as_bytes(), Vec::new()), Err(Error::Disconnected)));
-
-// `exit` without `shutdown`: the protocol's "exit with status 1".
-let input = frame(r#"{"jsonrpc":"2.0","method":"exit"}"#);
-assert!(matches!(server.run(input.as_bytes(), Vec::new()), Err(Error::ExitWithoutShutdown)));
+```rust,ignore
+pub fn serve_stdio<G: Grammar + Clone, H: Handler<G>>(grammar: G, handler: H) -> Result<(), Error>
 ```
+
+The one-call entry point: `Server::new(grammar, handler)` run on the process's
+standard input and output. **Errors:** as [`Server::run`](#serverrun).
 
 ## `Handler`
 
 ```rust,ignore
-pub trait Handler<G: Grammar> {
-    fn initialize(&mut self, params: Json<'_>, cx: &mut Context<'_, G>) -> Result<Value, ResponseError>;
-    fn changed(&mut self, document: &Document<G>, cx: &mut Context<'_, G>);
-    fn closed(&mut self, uri: &str, cx: &mut Context<'_, G>);
-    fn request(&mut self, method: &str, params: Json<'_>, cx: &mut Context<'_, G>) -> Result<Reply, ResponseError>;
-    fn notification(&mut self, method: &str, params: Json<'_>, cx: &mut Context<'_, G>);
-    fn response(&mut self, id: u64, result: Result<Json<'_>, ResponseError>, cx: &mut Context<'_, G>);
-}
+pub trait Handler<G: Grammar> { /* every method has a default */ }
 ```
 
-A language server's behaviour. Every method has a default, so a handler
-implements only what its language supports:
+The language's behaviour. Every method has a default, so a handler implements
+only what its language supports: a diagnostics-only server needs
+[`changed`](#handlerchanged) and nothing more.
 
 | Method | Called when | Default |
 |---|---|---|
-| [`initialize`](#handlerinitialize) | the client sends `initialize` | no capabilities beyond document sync |
+| [`initialize`](#handlerinitialize) | the client sends `initialize` | accepts |
+| [`features`](#handlerfeatures) | after `initialize`, to build the capabilities | none |
 | [`changed`](#handlerchanged) | a document opens or changes | nothing |
 | [`closed`](#handlerclosed) | a document closes | clears its diagnostics |
-| [`request`](#handlerrequest) | any request but `initialize` and `shutdown` | `MethodNotFound` |
-| [`notification`](#handlernotification) | any notification but `exit` and document sync | ignored |
+| [`hover`](#handlerhover), [`definition`](#handlerdefinition), [`completion`](#handlercompletion), [`document_symbols`](#handlerdocument_symbols), [`semantic_tokens`](#handlersemantic_tokens) | the matching request, if listed in `features` | `MethodNotFound` |
+| [`request`](#handlerrequest) | a [custom request](#servercustom_request) | `MethodNotFound` |
+| [`notification`](#handlernotification) | `initialized`, `didSave`, and other notifications | ignored |
 | [`response`](#handlerresponse) | the client answers a [`Context::request`](#contextrequest) | ignored |
 
 Calls are made one at a time, in message order, on the thread running
-[`Server::run`](#serverrun). Every method receives a [`Context`](#context). A
-panic in any method is contained where panics unwind (see
-[Three kinds of failure](#three-kinds-of-failure)).
-
-A handler that does not depend on the language can be written for every
-grammar at once — `impl<G: Grammar> Handler<G> for MyHandler` — as several
-examples below are.
+[`Server::run`](#serverrun). A panic in any method is contained where panics
+unwind (see [Three kinds of failure](#three-kinds-of-failure)).
 
 ### `Handler::initialize`
 
 ```rust,ignore
-fn initialize(&mut self, params: Json<'_>, cx: &mut Context<'_, G>) -> Result<Value, ResponseError>
+fn initialize(&mut self, params: &Value<'_>, cx: &mut Context<'_, G>) -> Result<(), ResponseError>
 ```
 
-Answers `initialize` with the server's capabilities.
-
-| Parameter | Meaning |
-|---|---|
-| `params` | The client's `InitializeParams`: `rootUri`, `initializationOptions`, client capabilities. |
-| `cx` | The session; no documents are open yet. |
-
-**Returns** the `ServerCapabilities` object for what the handler supports. The
-server adds `positionEncoding` and `textDocumentSync` before replying; other
-members of a `textDocumentSync` object the handler returns (such as `save`) are
-kept, while `openClose` and `change` are set by the server. A value that is not
-a JSON object is treated as `{}`. An error refuses `initialize`; the session
-stays uninitialized. A panic refuses it the same way, with `InternalError`.
-
-Anything sent through `cx` here is held back and written right after the
-`initialize` response, in the order sent, since the protocol lets a server send
-nothing before it has answered. If `initialize` fails, what was sent is
-discarded, and requests among it are forgotten (they get no
-[`response`](#handlerresponse)).
+Called when the client sends `initialize`, before it is answered. `params` is
+the client's `InitializeParams` (`rootUri`, `initializationOptions`, client
+capabilities), `null` if it sent none. An error refuses the request and leaves
+the session uninitialized. Anything sent through `cx` is held until after the
+`initialize` response, and discarded if `initialize` fails.
 
 ```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{json, Context, Handler, Json, ResponseError, Value};
+# use lsp_lang::incremental_lang::Grammar;
+use lsp_lang::{Context, Handler, ResponseError, Value};
 
-struct Navigator;
+struct Project { root: Option<String> }
 
-impl<G: Grammar> Handler<G> for Navigator {
-    fn initialize(&mut self, _: Json<'_>, _: &mut Context<'_, G>) -> Result<Value, ResponseError> {
-        Ok(json!({
-            "hoverProvider": true,
-            "definitionProvider": true,
-            // Merged with the server's own sync settings.
-            "textDocumentSync": { "save": { "includeText": false } },
-        }))
+impl<G: Grammar> Handler<G> for Project {
+    fn initialize(&mut self, params: &Value<'_>, _: &mut Context<'_, G>) -> Result<(), ResponseError> {
+        self.root = params["rootUri"].as_str().map(str::to_owned);
+        Ok(())
     }
 }
 ```
 
+### `Handler::features`
+
+```rust,ignore
+fn features(&self) -> Features
+```
+
+The [`Features`](#features) the handler implements. Called once per session,
+after `initialize` returned. Default: none.
+
 ```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{json, Context, Handler, Json, ResponseError, Value};
+# use lsp_lang::incremental_lang::Grammar;
+use lsp_lang::{Features, Handler};
 
-// Read the workspace root and the client's options.
-#[derive(Default)]
-struct Project { root: Option<String>, strict: bool }
+struct Navigator;
 
-impl<G: Grammar> Handler<G> for Project {
-    fn initialize(&mut self, params: Json<'_>, _: &mut Context<'_, G>) -> Result<Value, ResponseError> {
-        let params: Value = params.parse()?;
-        self.root = params["rootUri"].as_str().map(str::to_owned);
-        self.strict = params["initializationOptions"]["strict"].as_bool().unwrap_or(false);
-        if self.root.is_none() {
-            return Err(ResponseError::new(ResponseError::REQUEST_FAILED, "open a folder first"));
-        }
-        Ok(json!({}))
+impl<G: Grammar> Handler<G> for Navigator {
+    fn features(&self) -> Features {
+        Features::new().hover().definition().document_symbols()
     }
 }
 ```
@@ -733,87 +702,22 @@ impl<G: Grammar> Handler<G> for Project {
 fn changed(&mut self, document: &Document<G>, cx: &mut Context<'_, G>)
 ```
 
-Called after a document opens and after each `didChange`, once its text and
-tree are current. The usual body analyses the document and publishes
-diagnostics. A `didChange` carrying several edits produces one call. A change
-that leaves the document [out of step](#document-synchronization) produces no
-call; the next whole-text change or reopen does.
-
-| Parameter | Meaning |
-|---|---|
-| `document` | The document, up to date. |
-| `cx` | The session; publish through it. |
+Called after a document is opened and after each change to it, once the text
+and syntax tree are current. A `didChange` carrying several edits produces one
+call. The usual body analyses the document and publishes diagnostics. It is
+not called for a change that left the document out of step (see
+[Document synchronization](#document-synchronization)).
 
 ```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-use lsp_lang::diag_lang::{Label, Severity};
-use lsp_lang::{Context, Diagnostic, Document, Handler, Server};
-
-/// Flags lines longer than 20 characters.
-struct LongLines;
-
-impl Handler<Plain> for LongLines {
-    fn changed(&mut self, doc: &Document<Plain>, cx: &mut Context<'_, Plain>) {
-        let mut found = Vec::new();
-        let mut at = 0;
-        for line in doc.text().split_inclusive('\n') {
-            let content = line.trim_end_matches(['\r', '\n']);
-            if content.chars().count() > 20 {
-                let span = Span::new(at as u32, (at + content.len()) as u32);
-                found.push(Diagnostic::new(Severity::Warning, "line too long", Label::new(span, "")));
-            }
-            at += line.len();
-        }
-        cx.publish_diagnostics(doc, &found);
-    }
-}
-
-let input = session("short\nthis line is far too long to fit\nok", &[]);
-let mut output = Vec::new();
-Server::new(Plain, LongLines).run(input.as_bytes(), &mut output)?;
-let output = String::from_utf8_lossy(&output);
-assert!(output.contains(r#""range":{"start":{"line":1,"character":0},"end":{"line":1,"character":32}}"#));
-# Ok::<(), lsp_lang::Error>(())
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
+# use lsp_lang::incremental_lang::Grammar;
 use lsp_lang::{Context, Document, Handler};
 
-// Hand the tree to a worker: cloning it is O(1), and the snapshot never changes.
-struct Background { queue: Vec<(String, i32, String)> }
+#[derive(Default)]
+struct Watch { edits: u64 }
 
-impl<G: Grammar> Handler<G> for Background {
+impl<G: Grammar> Handler<G> for Watch {
     fn changed(&mut self, doc: &Document<G>, _: &mut Context<'_, G>) {
-        let _snapshot = doc.tree().clone();
-        self.queue.push((doc.uri().to_owned(), doc.version(), doc.text().to_owned()));
+        self.edits = doc.incremental().stats().edits;
     }
 }
 ```
@@ -824,195 +728,95 @@ impl<G: Grammar> Handler<G> for Background {
 fn closed(&mut self, uri: &str, cx: &mut Context<'_, G>)
 ```
 
-Called after the document `uri` was closed and removed by `didClose`. (A
-change that cannot be applied no longer closes a document; see
-[Document synchronization](#document-synchronization).) The default clears its
-diagnostics, as the protocol recommends; an override that keeps per-document
-state should drop it here and call
-[`Context::clear_diagnostics`](#contextclear_diagnostics) itself.
+Called after the document `uri` is closed and removed. The default clears the
+diagnostics published for it, as the protocol recommends; override it to drop
+per-document state, and call `cx.clear_diagnostics(uri)` to keep that.
 
-| Parameter | Meaning |
-|---|---|
-| `uri` | The closed document's URI. It is no longer in [`Context::document`](#contextdocument). |
-| `cx` | The session. |
+### `Handler::hover`
 
-```rust
-use std::collections::HashMap;
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Handler};
-
-#[derive(Default)]
-struct Index { symbols: HashMap<String, Vec<String>> }
-
-impl<G: Grammar> Handler<G> for Index {
-    fn closed(&mut self, uri: &str, cx: &mut Context<'_, G>) {
-        self.symbols.remove(uri);
-        cx.clear_diagnostics(uri); // keep the default's behaviour
-    }
-}
+```rust,ignore
+fn hover(&mut self, document: &Document<G>, position: Position, cx: &mut Context<'_, G>)
+    -> Result<Option<Hover>, ResponseError>
 ```
 
-```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-use lsp_lang::{Handler, Server};
+Answers `textDocument/hover`. `position` is the client's, in the session
+encoding; turn it into a byte offset with [`Document::offset`](#documentoffset).
+`Ok(None)` is "nothing here" (`null`). Requested only when
+[`Features::hover`](#features) is listed. Default: `MethodNotFound`.
 
-// The default clears the document's diagnostics on close.
-struct Defaults;
-impl Handler<Plain> for Defaults {}
+### `Handler::definition`
 
-let input = session("text", &[r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":
-    {"textDocument":{"uri":"file:///a"}}}"#]);
-let mut output = Vec::new();
-Server::new(Plain, Defaults).run(input.as_bytes(), &mut output)?;
-let output = String::from_utf8_lossy(&output);
-assert!(output.contains(r#""params":{"uri":"file:///a","diagnostics":[]}"#));
-# Ok::<(), lsp_lang::Error>(())
+```rust,ignore
+fn definition(&mut self, document: &Document<G>, position: Position, cx: &mut Context<'_, G>)
+    -> Result<Vec<Location>, ResponseError>
 ```
+
+Answers `textDocument/definition`. An empty list is "nowhere" and is sent as
+`null`. Locations may be in other documents. Requested only when
+[`Features::definition`](#features) is listed. Default: `MethodNotFound`.
+
+### `Handler::completion`
+
+```rust,ignore
+fn completion(&mut self, document: &Document<G>, position: Position, cx: &mut Context<'_, G>)
+    -> Result<Vec<CompletionItem>, ResponseError>
+```
+
+Answers `textDocument/completion`. The items are sent as a complete list
+(`isIncomplete: false`). Requested only when [`Features::completion`](#features)
+is listed. Default: `MethodNotFound`.
+
+### `Handler::document_symbols`
+
+```rust,ignore
+fn document_symbols(&mut self, document: &Document<G>, cx: &mut Context<'_, G>)
+    -> Result<Vec<DocumentSymbol>, ResponseError>
+```
+
+Answers `textDocument/documentSymbol` with the outline as a hierarchy.
+Requested only when [`Features::document_symbols`](#features) is listed.
+Default: `MethodNotFound`.
+
+### `Handler::semantic_tokens`
+
+```rust,ignore
+fn semantic_tokens(&mut self, document: &Document<G>, cx: &mut Context<'_, G>)
+    -> Result<SemanticTokens, ResponseError>
+```
+
+Answers `textDocument/semanticTokens/full` and its delta form. Return every
+token, built with a [`SemanticTokensBuilder`](#semantictokensbuilder); the
+server assigns the `resultId`, keeps the last answer per document, and turns
+the next one into a single token-aligned edit when the client asks for a
+delta. A `previousResultId` the server does not know is answered in full.
+Requested only when [`Features::semantic_tokens`](#features) is listed.
+Default: `MethodNotFound`.
 
 ### `Handler::request`
 
 ```rust,ignore
-fn request(&mut self, method: &str, params: Json<'_>, cx: &mut Context<'_, G>) -> Result<Reply, ResponseError>
+fn request(&mut self, method: &str, params: &Value<'_>, cx: &mut Context<'_, G>)
+    -> Result<Value<'static>, ResponseError>
 ```
 
-Answers a request — every request but `initialize` and `shutdown`, and only
-between them.
-
-| Parameter | Meaning |
-|---|---|
-| `method` | The request's method, such as `"textDocument/hover"`. |
-| `params` | Its parameters, to [`parse`](#jsonparse) into the handler's own type. `null` if absent. |
-| `cx` | The session. |
-
-**Returns** the response: a [`Reply`](#reply) (use [`Reply::null`](#replynull)
-for "nothing here") or a [`ResponseError`](#responseerror). `?` works on both
-[`Json::parse`](#jsonparse) and [`Reply::new`](#replynew). The default returns
-`MethodNotFound`; a handler with its own `match` should fall back to the same.
+Answers a [custom request](#servercustom_request). `params` is `null` when
+absent. Requests reach it only between `initialize` and `shutdown`. Default:
+`MethodNotFound`.
 
 ```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-# fn replies(out: &[u8]) -> Vec<lsp_lang::Value> {
-#     String::from_utf8_lossy(out).split("Content-Length: ")
-#         .filter_map(|m| m.split_once("\r\n\r\n"))
-#         .filter_map(|(_, body)| lsp_lang::serde_json::from_str(body).ok()).collect()
-# }
-use lsp_lang::{json, Context, Handler, Json, Position, Range, Reply, ResponseError, Server};
+# use lsp_lang::incremental_lang::Grammar;
+use lsp_lang::{Context, Handler, ResponseError, Value};
 
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Params<'a> {
-    #[serde(borrow)]
-    text_document: Doc<'a>,
-    position: Position,
-}
+struct Echo;
 
-#[derive(serde::Deserialize)]
-struct Doc<'a> { uri: &'a str }
-
-/// Hover: the word under the cursor and its range.
-struct Words;
-
-impl Handler<Plain> for Words {
-    fn request(&mut self, method: &str, params: Json<'_>, cx: &mut Context<'_, Plain>) -> Result<Reply, ResponseError> {
+impl<G: Grammar> Handler<G> for Echo {
+    fn request(&mut self, method: &str, params: &Value<'_>, _: &mut Context<'_, G>)
+        -> Result<Value<'static>, ResponseError>
+    {
         match method {
-            "textDocument/hover" => {
-                let p: Params<'_> = params.parse()?;
-                let Some(doc) = cx.document(p.text_document.uri) else { return Ok(Reply::null()) };
-                let text = doc.text();
-                let at = doc.offset(p.position) as usize;
-                let start = text[..at].rfind(' ').map_or(0, |i| i + 1);
-                let end = text[at..].find(' ').map_or(text.len(), |i| at + i);
-                let span = Span::new(start as u32, end as u32);
-                Ok(Reply::new(&json!({ "contents": &text[start..end], "range": doc.range(span) }))?)
-            }
+            "echo/params" => Ok(params.clone().into_owned()),
             _ => Err(ResponseError::new(ResponseError::METHOD_NOT_FOUND, method)),
         }
-    }
-}
-
-let input = session("héllo wörld", &[
-    r#"{"jsonrpc":"2.0","id":1,"method":"textDocument/hover","params":
-        {"textDocument":{"uri":"file:///a"},"position":{"line":0,"character":8}}}"#,
-    r#"{"jsonrpc":"2.0","id":2,"method":"textDocument/rename","params":{}}"#,
-]);
-let mut output = Vec::new();
-Server::new(Plain, Words).run(input.as_bytes(), &mut output)?;
-let replies = replies(&output);
-let hover = replies.iter().find(|m| m["id"] == 1).unwrap();
-assert_eq!(hover["result"]["contents"], "wörld");
-assert_eq!(hover["result"]["range"]["start"]["character"], 6);
-let rename = replies.iter().find(|m| m["id"] == 2).unwrap();
-assert_eq!(rename["error"]["code"], ResponseError::METHOD_NOT_FOUND);
-# Ok::<(), lsp_lang::Error>(())
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Handler, Json, Reply, ResponseError};
-
-// Refuse work on a document that changed underneath the request.
-struct Careful { busy: bool }
-
-impl<G: Grammar> Handler<G> for Careful {
-    fn request(&mut self, method: &str, _: Json<'_>, _: &mut Context<'_, G>) -> Result<Reply, ResponseError> {
-        if self.busy {
-            return Err(ResponseError::new(ResponseError::CONTENT_MODIFIED, "document changed; retry"));
-        }
-        Err(ResponseError::new(ResponseError::METHOD_NOT_FOUND, method))
     }
 }
 ```
@@ -1020,108 +824,86 @@ impl<G: Grammar> Handler<G> for Careful {
 ### `Handler::notification`
 
 ```rust,ignore
-fn notification(&mut self, method: &str, params: Json<'_>, cx: &mut Context<'_, G>)
+fn notification(&mut self, method: &str, params: &Value<'_>, cx: &mut Context<'_, G>)
 ```
 
-Receives a notification the server does not handle itself: everything but
-`exit` and document synchronization. That includes `initialized`,
-`workspace/didChangeConfiguration`, `textDocument/didSave`, and protocol
-notifications such as `$/cancelRequest` and `$/setTrace`, which a handler may
-ignore. Notifications before `initialize` or after `shutdown` never arrive.
+Receives the notifications the server does not handle itself (see
+[`custom_notification`](#servercustom_notification) for the list). Notifications
+before `initialize` or after `shutdown` are dropped. `$/cancelRequest` is the
+server's own and never arrives here. Default: ignored.
 
-| Parameter | Meaning |
-|---|---|
-| `method` | The notification's method. |
-| `params` | Its parameters; `null` if absent. |
-| `cx` | The session. |
+### `Handler::response`
+
+```rust,ignore
+fn response(&mut self, id: u64, result: Result<Value<'_>, ResponseError>, cx: &mut Context<'_, G>)
+```
+
+Receives the outcome of a request sent with [`Context::request`](#contextrequest):
+the client's result or error. An answer that is not a valid response (an error
+without a message, a non-integer code) arrives as an error with the code
+`INVALID_REQUEST`. A request cancelled for want of room, or never sent because
+`initialize` failed, arrives as `REQUEST_CANCELLED`. Each request has one
+outcome; an answer that matches no outstanding request is logged to the client
+and dropped. Default: ignored.
 
 ```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{json, Context, Handler, Json};
+# use lsp_lang::incremental_lang::Grammar;
+use lsp_lang::{Context, Handler, ResponseError, Value};
 
-// Say hello once the client is ready.
-struct Greeter;
+#[derive(Default)]
+struct Settings { pending: Option<u64>, tab_width: u64 }
 
-impl<G: Grammar> Handler<G> for Greeter {
-    fn notification(&mut self, method: &str, _: Json<'_>, cx: &mut Context<'_, G>) {
-        if method == "initialized" {
-            let hello = json!({ "type": 3, "message": "Lisp server ready" });
-            if let Err(err) = cx.notify("window/logMessage", &hello) {
-                eprintln!("{err}");
+impl<G: Grammar> Handler<G> for Settings {
+    fn response(&mut self, id: u64, result: Result<Value<'_>, ResponseError>, _: &mut Context<'_, G>) {
+        if self.pending == Some(id) {
+            self.pending = None;
+            if let Ok(items) = result {
+                self.tab_width = items[0]["tabWidth"].as_u64().unwrap_or(4);
             }
         }
     }
 }
 ```
 
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Handler, Json};
-
-// React to saves: the client sends `didSave` when `save` is in the
-// `textDocumentSync` capability.
-#[derive(Default)]
-struct SaveCounter { saves: u32 }
-
-#[derive(serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DidSave<'a> { #[serde(borrow)] text_document: Uri<'a> }
-#[derive(serde::Deserialize)]
-struct Uri<'a> { uri: &'a str }
-
-impl<G: Grammar> Handler<G> for SaveCounter {
-    fn notification(&mut self, method: &str, params: Json<'_>, _: &mut Context<'_, G>) {
-        if method == "textDocument/didSave" && params.parse::<DidSave<'_>>().is_ok() {
-            self.saves += 1;
-        }
-    }
-}
-```
-
-### `Handler::response`
+## `Features`
 
 ```rust,ignore
-fn response(&mut self, id: u64, result: Result<Json<'_>, ResponseError>, cx: &mut Context<'_, G>)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Features { /* private */ }
 ```
 
-Receives the client's answer to a request sent with
-[`Context::request`](#contextrequest). Each request is answered at most once:
-an answer that matches no request still awaiting one — a second answer, an id
-the server never sent, an answer with no id — is logged and dropped, and the
-server never replies to an answer. A request cancelled to stay under the cap
-on outstanding requests (see [`Context::request`](#contextrequest)) receives
-`RequestCancelled` (`-32800`) here instead, once.
+What a handler offers, from which the server's capabilities are derived.
 
-| Parameter | Meaning |
-|---|---|
-| `id` | The id [`Context::request`](#contextrequest) returned. |
-| `result` | The response's result, or the error the client answered with, read leniently: a missing message reads as empty, and a missing or out-of-range code — or an `error` that is not an object — as `INTERNAL_ERROR`. |
-| `cx` | The session. |
+| Method | Capability | Handler method |
+|---|---|---|
+| `Features::new()` | none | none |
+| `.hover()` | `hoverProvider` | [`hover`](#handlerhover) |
+| `.definition()` | `definitionProvider` | [`definition`](#handlerdefinition) |
+| `.completion(&[&str])` | `completionProvider` with the trigger characters | [`completion`](#handlercompletion) |
+| `.document_symbols()` | `documentSymbolProvider` | [`document_symbols`](#handlerdocument_symbols) |
+| `.semantic_tokens(legend)` | `semanticTokensProvider` with the legend and `full: { delta: true }` | [`semantic_tokens`](#handlersemantic_tokens) |
+| `.capability(name, value)` | any other `ServerCapabilities` member | [`request`](#handlerrequest) |
+| `.semantic_tokens_legend()` | | the legend listed, if any |
+| `.capabilities_json()` | | the capabilities these features produce, before the server's own |
+
+`capability` overrides a derived capability of the same name. It cannot
+override `positionEncoding`, and a `textDocumentSync` object is merged into the
+server's own: `openClose` and `change` stay the server's, other members such as
+`save` are kept.
 
 ```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{json, Context, Handler, Json, ResponseError, Value};
+use lsp_lang::{json, Features, SemanticTokensLegend};
 
-// Ask for configuration once ready; apply the answer when it comes.
-#[derive(Default)]
-struct Configured { pending: Option<u64>, tab_width: u64 }
-
-impl<G: Grammar> Handler<G> for Configured {
-    fn notification(&mut self, method: &str, _: Json<'_>, cx: &mut Context<'_, G>) {
-        if method == "initialized" {
-            let items = json!({ "items": [{ "section": "editor" }] });
-            self.pending = cx.request("workspace/configuration", &items).ok();
-        }
-    }
-
-    fn response(&mut self, id: u64, result: Result<Json<'_>, ResponseError>, _: &mut Context<'_, G>) {
-        if self.pending.take() != Some(id) {
-            return;
-        }
-        let settings: Vec<Value> = result.and_then(|json| json.parse()).unwrap_or_default();
-        self.tab_width = settings.first().and_then(|s| s["tabWidth"].as_u64()).unwrap_or(4);
-    }
-}
+let features = Features::new()
+    .hover()
+    .completion(&["(", " "])
+    .semantic_tokens(SemanticTokensLegend::standard())
+    .capability("renameProvider", json!(true));
+let caps = features.capabilities_json();
+assert_eq!(caps["hoverProvider"], true);
+assert_eq!(caps["completionProvider"]["triggerCharacters"][0], "(");
+assert_eq!(caps["renameProvider"], true);
+assert!(caps.get("definitionProvider").is_none());
 ```
 
 ## `Context`
@@ -1130,14 +912,11 @@ impl<G: Grammar> Handler<G> for Configured {
 pub struct Context<'a, G: Grammar> { /* private */ }
 ```
 
-A handler's view of the session for one call: the open documents, and a
-channel back to the client. Messages sent through a context are buffered and
-written in order as soon as the handler returns, with any response to the
-current request after them.
-
-Documents borrowed from a context live for the whole call (`'a`), not just the
-borrow of the context, so a handler can hold one and send messages at once.
-`Debug` shows the number of open documents and the next request id.
+A handler's view of the session for one call: the open documents, and a channel
+to the client. Messages sent through it are written in the order sent, in one
+write, as soon as the handler returns, before the response to the request being
+handled. Documents borrowed from a context live for the whole call, so a handler
+can hold a document and send messages at the same time.
 
 ### `Context::document`
 
@@ -1145,34 +924,8 @@ borrow of the context, so a handler can hold one and send messages at once.
 pub fn document(&self, uri: &str) -> Option<&'a Document<G>>
 ```
 
-Returns the open document with this URI. URIs match exactly, as the client
-sent them.
-
-| Parameter | Meaning |
-|---|---|
-| `uri` | The document's URI. |
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Diagnostic};
-
-// Look a document up and publish to it in the same breath.
-fn report<G: Grammar>(cx: &mut Context<'_, G>, uri: &str, found: &[Diagnostic]) -> bool {
-    let Some(doc) = cx.document(uri) else { return false };
-    cx.publish_diagnostics(doc, found);
-    true
-}
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Context;
-
-fn line_count<G: Grammar>(cx: &Context<'_, G>, uri: &str) -> Option<u32> {
-    let doc = cx.document(uri)?;
-    Some(doc.position(doc.text().len() as u32).line + 1)
-}
-```
+The open document with this URI, if any. URIs match exactly, as the client sent
+them.
 
 ### `Context::documents`
 
@@ -1180,123 +933,57 @@ fn line_count<G: Grammar>(cx: &Context<'_, G>, uri: &str) -> Option<u32> {
 pub fn documents(&self) -> impl ExactSizeIterator<Item = &'a Document<G>> + 'a
 ```
 
-Returns every open document, ordered by URI (so anything published while
-iterating goes out in the same order every run).
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Diagnostic};
-
-// Re-check everything, e.g. after a configuration change.
-fn recheck_all<G: Grammar>(cx: &mut Context<'_, G>, check: impl Fn(&str) -> Vec<Diagnostic>) {
-    for doc in cx.documents() {
-        let found = check(doc.text());
-        cx.publish_diagnostics(doc, &found);
-    }
-}
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Context;
-
-fn open_bytes<G: Grammar>(cx: &Context<'_, G>) -> usize {
-    cx.documents().map(|doc| doc.text().len()).sum()
-}
-```
+Every open document, ordered by URI.
 
 ### `Context::notify`
 
 ```rust,ignore
-pub fn notify<P: Serialize + ?Sized>(&mut self, method: &str, params: &P) -> Result<(), Error>
+pub fn notify<'p>(&mut self, method: &str, params: impl Into<rpc_io::Json<'p>>) -> Result<(), Error>
 ```
 
-Sends a notification to the client. `params` is serialized straight into the
-outgoing message.
-
-| Parameter | Meaning |
-|---|---|
-| `method` | The notification's method. |
-| `params` | Any `Serialize` value, including a [`Value`](#re-exports) from [`json!`](#re-exports). |
-
-**Errors.** [`Error::Json`](#error) if `params` fails to serialize. Nothing is
-sent, and the session continues.
+Sends a notification. `params` is a [`Value`](#re-exports) built with `json!`,
+a pre-serialized `rpc_io::Raw`, or `()` for none: an array or an object.
+**Errors:** [`Error::InvalidParams`](#error) for a scalar,
+[`Error::Closed`](#error) when the connection has ended. Nothing is sent in
+either case and the session carries on.
 
 ```rust
-use lsp_lang::incremental_lang::Grammar;
+# use lsp_lang::incremental_lang::Grammar;
 use lsp_lang::{json, Context, Error};
 
-// `MessageType` 1 = error, 2 = warning, 3 = info, 4 = log.
-fn warn<G: Grammar>(cx: &mut Context<'_, G>, text: &str) -> Result<(), Error> {
-    cx.notify("window/showMessage", &json!({ "type": 2, "message": text }))
-}
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Error};
-
-// A typed payload, serialized without an intermediate value.
-#[derive(serde::Serialize)]
-struct Progress<'a> { token: &'a str, value: Report }
-#[derive(serde::Serialize)]
-struct Report { kind: &'static str, percentage: u32 }
-
-fn progress<G: Grammar>(cx: &mut Context<'_, G>, percent: u32) -> Result<(), Error> {
-    let value = Report { kind: "report", percentage: percent };
-    cx.notify("$/progress", &Progress { token: "indexing", value })
+fn announce<G: Grammar>(cx: &mut Context<'_, G>) -> Result<(), Error> {
+    cx.notify("window/showMessage", json!({ "type": 3, "message": "Indexing done" }))
 }
 ```
 
 ### `Context::request`
 
 ```rust,ignore
-pub fn request<P: Serialize + ?Sized>(&mut self, method: &str, params: &P) -> Result<u64, Error>
+pub fn request<'p>(&mut self, method: &str, params: impl Into<rpc_io::Json<'p>>) -> Result<u64, Error>
 ```
 
-Sends a request to the client and returns the id it was sent with; the answer
-arrives later through [`Handler::response`](#handlerresponse) with the same
-id, exactly once. Ids count up from 0 in each session.
+Sends a request to the client and returns its id (counting up from 1 in each
+session). The outcome arrives later through
+[`Handler::response`](#handlerresponse), exactly once. At most 1024 requests
+await an answer at once; one more cancels the oldest. **Errors:** as
+[`notify`](#contextnotify).
 
-At most **1024** requests await an answer at once. Sending one more cancels
-the oldest still outstanding: the server sends the client `$/cancelRequest`
-for it and, once the current handler call returns, delivers `RequestCancelled`
-(`-32800`) to [`Handler::response`](#handlerresponse) as its answer. A late
-answer from the client is then logged and dropped. Settling an answer costs
-O(log n) in the number outstanding.
+### `Context::log`
 
-| Parameter | Meaning |
-|---|---|
-| `method` | The request's method, such as `"workspace/configuration"`. |
-| `params` | Any `Serialize` value. |
-
-**Errors.** [`Error::Json`](#error) if `params` fails to serialize. Nothing is
-sent and no id is used.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{json, Context, Error};
-
-fn ask_settings<G: Grammar>(cx: &mut Context<'_, G>) -> Result<u64, Error> {
-    cx.request("workspace/configuration", &json!({ "items": [{ "section": "lisp" }] }))
-}
+```rust,ignore
+pub fn log(&mut self, kind: MessageType, message: &str)
 ```
 
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{json, Context, Error};
+Sends `window/logMessage`: a line for the client's output log.
 
-// Register for file-watch events at runtime.
-fn watch_lisp_files<G: Grammar>(cx: &mut Context<'_, G>) -> Result<u64, Error> {
-    cx.request("client/registerCapability", &json!({
-        "registrations": [{
-            "id": "watch",
-            "method": "workspace/didChangeWatchedFiles",
-            "registerOptions": { "watchers": [{ "globPattern": "**/*.lisp" }] },
-        }],
-    }))
-}
+#### `MessageType`
+
+```rust,ignore
+#[non_exhaustive]
+pub enum MessageType { Error = 1, Warning = 2, Info = 3, Log = 4 }
 ```
+
+`as_u32(self) -> u32` gives the protocol's number.
 
 ### `Context::publish_diagnostics`
 
@@ -1304,20 +991,14 @@ fn watch_lisp_files<G: Grammar>(cx: &mut Context<'_, G>) -> Result<u64, Error> {
 pub fn publish_diagnostics(&mut self, document: &Document<G>, diagnostics: &[Diagnostic])
 ```
 
-Publishes `diagnostics` for `document`, replacing what was published for it
-before. Spans are byte offsets into the document's text; they are converted to
-ranges in the session encoding (clamped to the text) and the rest is mapped as
-[described above](#diagnostics-mapping). The notification carries the
-document's version. An empty slice clears the document's diagnostics.
-
-All spans are converted in one ascending pass before anything is written, so
-many diagnostics on one long line cost one scan of that line, in whatever
-order they come.
-
-| Parameter | Meaning |
-|---|---|
-| `document` | The document the diagnostics are about. |
-| `diagnostics` | The diagnostics, spans in the document's byte offsets. |
+Publishes `diagnostics` for `document`, replacing what was published before.
+Spans are byte offsets into the document's text; they are converted to ranges
+in the session encoding (clamped to the text), all in one ascending pass, so
+many diagnostics on one long line cost one scan of it. The message is joined
+from the headline, the primary label, notes, and help, and secondary labels
+become related information ([the mapping](#diagnostics-mapping)). The
+notification carries the document's version. An empty slice clears the
+document's diagnostics.
 
 ```rust
 # use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
@@ -1338,62 +1019,24 @@ order they come.
 #         b.finish();
 #     }
 # }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-# fn replies(out: &[u8]) -> Vec<lsp_lang::Value> {
-#     String::from_utf8_lossy(out).split("Content-Length: ")
-#         .filter_map(|m| m.split_once("\r\n\r\n"))
-#         .filter_map(|(_, body)| lsp_lang::serde_json::from_str(body).ok()).collect()
-# }
 use lsp_lang::diag_lang::{Label, Severity};
-use lsp_lang::{json, Context, Diagnostic, Document, Handler, Server};
+use lsp_lang::{Context, Diagnostic, Document, Handler};
 
-/// Reports a duplicated word, linking back to its first occurrence.
-struct Doubles;
+struct NoTabs;
 
-impl Handler<Plain> for Doubles {
+impl Handler<Plain> for NoTabs {
     fn changed(&mut self, doc: &Document<Plain>, cx: &mut Context<'_, Plain>) {
-        let text = doc.text();
-        let (first, second) = (text.find("the").unwrap(), text.rfind("the").unwrap());
-        let span = |at: usize| Span::new(at as u32, at as u32 + 3);
-        let found = Diagnostic::new(Severity::Error, "word repeated", Label::new(span(second), "again here"))
-            .with_secondary(Label::new(span(first), "first here"))
-            .with_help("delete one");
-        cx.publish_diagnostics(doc, &[found]);
+        let found: Vec<Diagnostic> = doc
+            .text()
+            .match_indices('\t')
+            .map(|(at, _)| {
+                let at = at as u32;
+                Diagnostic::new(Severity::Warning, "tab character",
+                    Label::new(Span::new(at, at + 1), "indent with spaces"))
+            })
+            .collect();
+        cx.publish_diagnostics(doc, &found);
     }
-}
-
-let input = session("😀 the\nthe end", &[]);
-let mut output = Vec::new();
-Server::new(Plain, Doubles).run(input.as_bytes(), &mut output)?;
-let replies = replies(&output);
-let params = &replies.iter().find(|m| m["method"] == "textDocument/publishDiagnostics").unwrap()["params"];
-assert_eq!(params["version"], 1);
-let d = &params["diagnostics"][0];
-assert_eq!(d["severity"], 1);
-assert_eq!(d["message"], "word repeated\nagain here\nhelp: delete one");
-assert_eq!(d["range"]["start"], json!({ "line": 1, "character": 0 }));
-// `😀` is two UTF-16 units, so the first `the` starts at column 3.
-assert_eq!(d["relatedInformation"][0]["location"]["range"]["start"], json!({ "line": 0, "character": 3 }));
-# Ok::<(), lsp_lang::Error>(())
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Context, Diagnostic, Document};
-
-// Publish diagnostics produced by any stage built on diag-lang.
-fn publish_all<G: Grammar>(cx: &mut Context<'_, G>, doc: &Document<G>, stages: &[Vec<Diagnostic>]) {
-    let all: Vec<Diagnostic> = stages.iter().flatten().cloned().collect();
-    cx.publish_diagnostics(doc, &all);
 }
 ```
 
@@ -1406,324 +1049,51 @@ pub fn clear_diagnostics(&mut self, uri: &str)
 Clears the diagnostics published for `uri`, whether or not the document is
 open. The default [`Handler::closed`](#handlerclosed) calls it.
 
-| Parameter | Meaning |
-|---|---|
-| `uri` | The document whose diagnostics to clear. |
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Context;
-
-// Forget everything reported, e.g. when the project is reloaded.
-fn clear_all<G: Grammar>(cx: &mut Context<'_, G>) {
-    let uris: Vec<&str> = cx.documents().map(|doc| doc.uri()).collect();
-    for uri in uris {
-        cx.clear_diagnostics(uri);
-    }
-}
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Context;
-
-// Clear a file the client never opened, after deleting it on disk.
-fn forget<G: Grammar>(cx: &mut Context<'_, G>) {
-    cx.clear_diagnostics("file:///project/removed.lisp");
-}
-```
-
 ## `Document`
 
 ```rust,ignore
 pub struct Document<G: Grammar> { /* private */ }
 ```
 
-A document the client has open: its text, its syntax tree, and the
-conversions between protocol positions and byte offsets in the session's
-[encoding](#encoding). Created by the server on `didOpen`, updated on every
-`didChange`, dropped on `didClose`; handlers see it read-only.
+A document the client has open: its text, its syntax tree, and the conversions
+between protocol positions and byte offsets in the session's
+[encoding](#positions-position-range-encoding). Created by the server on
+`didOpen`, updated on every `didChange`, dropped on `didClose`; handlers see it
+read-only. `Debug` shows the URI, version, encoding, and length, not the text.
 
-Each document pairs an [`incremental_lang::Document`](#documentincremental)
-with a line index. An edit is converted from its range to a byte span,
-reparsed incrementally — only the innermost node around it that can be
-reparsed on its own is rebuilt — and folded into the line index in place.
-`Debug` shows the URI, version, encoding, and length, not the text.
-
-### `Document::uri`
-
-```rust,ignore
-pub fn uri(&self) -> &str
-```
-
-The document's URI, exactly as the client sent it.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Document;
-
-fn is_test<G: Grammar>(doc: &Document<G>) -> bool {
-    doc.uri().ends_with("_test.lisp")
-}
-```
-
-### `Document::version`
-
-```rust,ignore
-pub fn version(&self) -> i32
-```
-
-The version the client gave the current text; it increases with every change.
-Published diagnostics carry it, so the client can discard results for text it
-has since replaced.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Document;
-
-// Skip work if this version was already analysed.
-fn is_new<G: Grammar>(doc: &Document<G>, last_seen: &mut i32) -> bool {
-    let new = doc.version() != *last_seen;
-    *last_seen = doc.version();
-    new
-}
-```
-
-### `Document::text`
-
-```rust,ignore
-pub fn text(&self) -> &str
-```
-
-The current text.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Document;
-
-fn word_count<G: Grammar>(doc: &Document<G>) -> usize {
-    doc.text().split_whitespace().count()
-}
-```
+| Method | Returns |
+|---|---|
+| `uri(&self) -> &str` | The URI, exactly as the client sent it. |
+| `version(&self) -> i32` | The version the client gave the current text. Diagnostics carry it. |
+| `text(&self) -> &str` | The current text. |
+| `tree(&self) -> &Tree<G::Kind>` | The syntax tree; clone it (one reference-count increment) to keep a snapshot. |
+| `incremental(&self) -> &incremental_lang::Document<G>` | The underlying incremental document, for its grammar and reparse statistics. |
+| `encoding(&self) -> Encoding` | The session's position encoding. |
+| `position(&self, offset: u32) -> Position` | A byte offset as a position. Past the end clamps; inside a character rounds down. |
+| `offset(&self, position: Position) -> u32` | A position as a byte offset. Always a character boundary within the text. |
+| `range(&self, span: Span) -> Range` | A byte span as a range. |
+| `span(&self, range: Range) -> Span` | A range as a byte span; a reversed range yields the span between its ends. |
 
 ### `Document::tree`
 
-```rust,ignore
-pub fn tree(&self) -> &Tree<G::Kind>
-```
-
-The current syntax tree — the grammar's lossless concrete syntax tree of the
-text, with spans in byte offsets. Clone it (one reference-count increment) for
-a snapshot that later edits leave untouched.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Range};
-
-// Ranges of the top-level nodes, for an outline or folding.
-fn top_level<G: Grammar>(doc: &Document<G>) -> Vec<Range> {
-    doc.tree().root().children().map(|child| doc.range(child.span())).collect()
-}
-```
-
-```rust
-use lsp_lang::incremental_lang::{Grammar, Tree};
-use lsp_lang::Document;
-
-// A snapshot for another thread.
-fn snapshot<G: Grammar>(doc: &Document<G>) -> Tree<G::Kind> {
-    doc.tree().clone()
-}
-```
-
-### `Document::incremental`
-
-```rust,ignore
-pub fn incremental(&self) -> &incremental_lang::Document<G>
-```
-
-The underlying incremental document, for its grammar and its reparse
-statistics.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::Document;
-
-// Are this grammar's reparsable kinds paying off?
-fn incremental_share<G: Grammar>(doc: &Document<G>) -> f64 {
-    let stats = doc.incremental().stats();
-    stats.partial as f64 / stats.edits.max(1) as f64
-}
-```
-
-### `Document::encoding`
-
-```rust,ignore
-pub fn encoding(&self) -> Encoding
-```
-
-The [encoding](#encoding) negotiated for the session. The conversion methods
-apply it already; it matters only to a handler counting columns itself.
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Encoding};
-
-fn columns_are_bytes<G: Grammar>(doc: &Document<G>) -> bool {
-    doc.encoding() == Encoding::Utf8
-}
-```
+The tree is the grammar's lossless concrete syntax tree of `text`; its spans are
+byte offsets into that text, ready for `range`.
 
 ### `Document::position`
 
-```rust,ignore
-pub fn position(&self, offset: u32) -> Position
-```
-
-Converts a byte offset into the text to a protocol position. Past the end maps
-to the end; inside a character maps to that character; between the `\r` and
-`\n` of one line break, to the column just past the `\r`. Cost: a binary search
-over line starts, plus — in a UTF-16 session — a vectorized count over the
+Cost: a binary search over the line starts, plus, for UTF-16, a count over the
 line's text before the offset.
-
-| Parameter | Meaning |
-|---|---|
-| `offset` | A byte offset into [`text`](#documenttext). |
-
-```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-use lsp_lang::{Context, Document, Handler, Position, Server};
-
-#[derive(Default)]
-struct Probe(Vec<Position>);
-
-impl Handler<Plain> for Probe {
-    fn changed(&mut self, doc: &Document<Plain>, _: &mut Context<'_, Plain>) {
-        // "a😀b\r\nc": `b` is byte 5, `c` byte 8; 99 is past the end.
-        self.0 = [5, 8, 99, 2].iter().map(|&at| doc.position(at)).collect();
-    }
-}
-
-let mut server = Server::new(Plain, Probe::default());
-server.run(session("a😀b\r\nc", &[]).as_bytes(), Vec::new())?;
-assert_eq!(server.handler().0, [
-    Position::new(0, 3), // UTF-16: `😀` counts two
-    Position::new(1, 0),
-    Position::new(1, 1), // clamped to the end
-    Position::new(0, 1), // inside `😀`: its start
-]);
-# Ok::<(), lsp_lang::Error>(())
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Position};
-
-fn find<G: Grammar>(doc: &Document<G>, needle: &str) -> Option<Position> {
-    doc.text().find(needle).map(|at| doc.position(at as u32))
-}
-```
 
 ### `Document::offset`
 
-```rust,ignore
-pub fn offset(&self, position: Position) -> u32
-```
-
-Converts a protocol position to a byte offset into the text. A line past the
-last maps to the end of the text; a column past the end of its line maps to
-the end of the line, before its break; a column inside a character maps to its
-start. The result is always a character boundary.
-
-| Parameter | Meaning |
-|---|---|
-| `position` | A position in the session's encoding — typically a request's cursor. |
+Out-of-range input is clamped as the protocol prescribes (see [Positions and
+encodings](#positions-and-encodings)).
 
 ```rust
-# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
-# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-# enum K { Root, Text }
-# impl TokenKind for K {}
-# #[derive(Clone)]
-# struct Plain;
-# impl Grammar for Plain {
-#     type Kind = K;
-#     const ROOT: K = K::Root;
-#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
-#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
-#     }
-#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
-#         b.start(K::Root);
-#         while !b.at_end() { b.bump(); }
-#         b.finish();
-#     }
-# }
-# fn frame(json: &str) -> String { format!("Content-Length: {}\r\n\r\n{json}", json.len()) }
-# fn session(text: &str, rest: &[&str]) -> String {
-#     let open = lsp_lang::json!({"jsonrpc":"2.0","method":"textDocument/didOpen","params":
-#         {"textDocument":{"uri":"file:///a","languageId":"x","version":1,"text":text}}});
-#     let mut s = frame(r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{}}"#);
-#     s += &frame(&open.to_string());
-#     for m in rest { s += &frame(m); }
-#     s += &frame(r#"{"jsonrpc":"2.0","id":99,"method":"shutdown"}"#);
-#     s + &frame(r#"{"jsonrpc":"2.0","method":"exit"}"#)
-# }
-use lsp_lang::{Context, Document, Handler, Position, Server};
+# use lsp_lang::incremental_lang::Grammar;
+use lsp_lang::{Document, Position, Range};
 
-#[derive(Default)]
-struct Probe(Vec<u32>);
-
-impl Handler<Plain> for Probe {
-    fn changed(&mut self, doc: &Document<Plain>, _: &mut Context<'_, Plain>) {
-        let at = [(0, 3), (0, 2), (0, 50), (1, 1), (9, 0)];
-        self.0 = at.iter().map(|&(l, c)| doc.offset(Position::new(l, c))).collect();
-    }
-}
-
-let mut server = Server::new(Plain, Probe::default());
-server.run(session("a😀b\r\nc", &[]).as_bytes(), Vec::new())?;
-assert_eq!(server.handler().0, [
-    5, // after `😀`, on `b`
-    1, // between the halves of `😀`: its start
-    6, // past the line's end: before `\r\n`
-    9, // end of line 1
-    9, // past the last line: end of text
-]);
-# Ok::<(), lsp_lang::Error>(())
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Position};
-
-// The word under a cursor.
+// The word under the cursor, for a hover request.
 fn word_at<G: Grammar>(doc: &Document<G>, cursor: Position) -> &str {
     let text = doc.text();
     let at = doc.offset(cursor) as usize;
@@ -1732,507 +1102,269 @@ fn word_at<G: Grammar>(doc: &Document<G>, cursor: Position) -> &str {
     let end = text[at..].find(|c| !is_word(c)).map_or(text.len(), |i| at + i);
     &text[start..end]
 }
-```
 
-### `Document::range`
-
-```rust,ignore
-pub fn range(&self, span: Span) -> Range
-```
-
-Converts a byte span — from the tree or a diagnostic — to a protocol range,
-each end as by [`position`](#documentposition).
-
-| Parameter | Meaning |
-|---|---|
-| `span` | A byte span of the text. |
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Range};
-
-fn whole<G: Grammar>(doc: &Document<G>) -> Range {
+// The range covering the whole document.
+fn everything<G: Grammar>(doc: &Document<G>) -> Range {
     doc.range(doc.tree().root().span())
 }
 ```
 
-```rust
-use lsp_lang::incremental_lang::{Grammar, Span};
-use lsp_lang::{json, Document, Value};
-
-// A `Location` for a definition result.
-fn location<G: Grammar>(doc: &Document<G>, span: Span) -> Value {
-    json!({ "uri": doc.uri(), "range": doc.range(span) })
-}
-```
-
-### `Document::span`
+## Positions: `Position`, `Range`, `Encoding`
 
 ```rust,ignore
-pub fn span(&self, range: Range) -> Span
+pub struct Position { pub line: u32, pub character: u32 }
+pub struct Range { pub start: Position, pub end: Position }
+#[non_exhaustive] pub enum Encoding { Utf8, Utf16 }
 ```
 
-Converts a protocol range to a byte span, each end as by
-[`offset`](#documentoffset). A range whose ends arrive reversed yields the span
-between them.
+`Position` is a zero-based line and a column in the session encoding; it orders
+by line, then column. `Range` is `start` inclusive to `end` exclusive; an empty
+range marks a point. `Encoding::default()` is `Utf16`.
 
-| Parameter | Meaning |
+| Method | |
 |---|---|
-| `range` | A range in the session's encoding — typically a request's selection. |
+| `Position::new(line, character)`, `Range::new(start, end)` | `const` constructors. |
+| `to_json(&self) -> Value<'static>` | The protocol's JSON (`{"line":…,"character":…}`, `{"start":…,"end":…}`). |
+| `from_json(&Value) -> Result<Self, ResponseError>` | Reads the JSON. `INVALID_PARAMS` for a missing member or one that is not an unsigned 32-bit integer. |
 
 ```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Range};
+use lsp_lang::{json, Position, Range};
 
-fn selected<G: Grammar>(doc: &Document<G>, range: Range) -> &str {
-    let span = doc.span(range);
-    &doc.text()[span.start().to_usize()..span.end().to_usize()]
-}
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Range};
-
-// The tree nodes a selection overlaps.
-fn overlapping<G: Grammar>(doc: &Document<G>, range: Range) -> usize {
-    let span = doc.span(range);
-    doc.tree()
-        .root()
-        .descendants()
-        .filter(|n| n.span().start() < span.end() && span.start() < n.span().end())
-        .count()
-}
-```
-
-## `Json`
-
-```rust,ignore
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub struct Json<'a> { /* private */ }
-```
-
-A JSON value from an incoming message — a request's or notification's
-parameters, or a response's result — kept as the raw text the client sent.
-Nothing is parsed until [`parse`](#jsonparse) is called, and then straight into
-the requested type, borrowing strings from the message where they have no
-escapes. `Debug` prints the raw JSON.
-
-### `Json::from_raw`
-
-```rust,ignore
-pub const fn from_raw(raw: &'a str) -> Json<'a>
-```
-
-Wraps raw JSON text. The server builds every `Json` a handler receives; this is
-for calling a handler's logic directly, as in its unit tests. The text is not
-checked until [`parse`](#jsonparse).
-
-```rust
-use lsp_lang::{Json, Position};
-
-let params = Json::from_raw(r#"{"line":4,"character":2}"#);
-let pos: Position = params.parse()?;
-assert_eq!(pos, Position::new(4, 2));
+let range = Range::new(Position::new(3, 4), Position::new(3, 9));
+assert_eq!(range.to_json().to_string(),
+    r#"{"start":{"line":3,"character":4},"end":{"line":3,"character":9}}"#);
+assert_eq!(Range::from_json(&range.to_json())?, range);
+assert!(Position::from_json(&json!({ "line": -1, "character": 0 })).is_err());
 # Ok::<(), lsp_lang::ResponseError>(())
 ```
 
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Json, ResponseError};
-
-// Test the parsing half of a handler without a server.
-fn parse_query(params: Json<'_>) -> Result<String, ResponseError> {
-    let v: lsp_lang::Value = params.parse()?;
-    v["query"].as_str().map(str::to_owned).ok_or_else(|| {
-        ResponseError::new(ResponseError::INVALID_PARAMS, "missing `query`")
-    })
-}
-
-assert_eq!(parse_query(Json::from_raw(r#"{"query":"fn"}"#)).unwrap(), "fn");
-assert!(parse_query(Json::from_raw("{}")).is_err());
-```
-
-### `Json::parse`
+## Results: `Location`, `Hover`, `MarkupKind`, `TextEdit`
 
 ```rust,ignore
-pub fn parse<T: Deserialize<'a>>(self) -> Result<T, ResponseError>
+pub struct Location { pub uri: String, pub range: Range }
+#[non_exhaustive] pub struct Hover { pub contents: String, pub kind: MarkupKind, pub range: Option<Range> }
+#[non_exhaustive] pub enum MarkupKind { PlainText, Markdown }
+pub struct TextEdit { pub range: Range, pub new_text: String }
 ```
 
-Deserializes the value into `T` — a handler's own struct (which may borrow
-`&'a str` fields from the message), a [`Position`](#position), or a
-[`Value`](#re-exports).
-
-**Errors.** A [`ResponseError`](#responseerror) with code `INVALID_PARAMS`
-carrying `serde_json`'s description of the mismatch, ready to return with `?`.
-
-```rust
-use lsp_lang::Json;
-
-#[derive(serde::Deserialize)]
-struct Rename<'a> { #[serde(rename = "newName")] new_name: &'a str }
-
-let params = Json::from_raw(r#"{"newName":"total","extra":true}"#);
-let rename: Rename<'_> = params.parse()?; // unknown fields are ignored
-assert_eq!(rename.new_name, "total");
-# Ok::<(), lsp_lang::ResponseError>(())
-```
-
-```rust
-use lsp_lang::{Json, ResponseError};
-
-let err = Json::from_raw(r#"{"line":"three"}"#).parse::<lsp_lang::Position>().unwrap_err();
-assert_eq!(err.code(), ResponseError::INVALID_PARAMS);
-assert!(err.message().starts_with("invalid params"));
-```
-
-### `Json::as_str`
-
-```rust,ignore
-pub const fn as_str(self) -> &'a str
-```
-
-The raw JSON text, exactly as the client sent it — to log it, or to forward it
-without parsing.
-
-```rust
-use lsp_lang::Json;
-
-let params = Json::from_raw(r#"{ "a": [1, 2] }"#);
-assert_eq!(params.as_str(), r#"{ "a": [1, 2] }"#);
-```
-
-## `Reply`
-
-```rust,ignore
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Reply { /* private */ }
-```
-
-A request's successful result, already serialized. Serializing directly to
-text, rather than building a [`Value`](#re-exports) first, keeps a large result
-to one pass and one allocation; the server copies the text into the response
-verbatim.
-
-### `Reply::new`
-
-```rust,ignore
-pub fn new<T: Serialize + ?Sized>(value: &T) -> Result<Reply, Error>
-```
-
-Serializes `value` as the result.
-
-| Parameter | Meaning |
+| Item | Methods |
 |---|---|
-| `value` | Any `Serialize` value. |
-
-**Errors.** [`Error::Json`](#error) if serialization fails (a map with
-non-string keys, a custom `Serialize` that errors). Inside
-[`Handler::request`](#handlerrequest), `?` turns it into an `INTERNAL_ERROR`
-response.
+| `Location` | `new(uri, range)`, `to_json`, `from_json` |
+| `Hover` | `markdown(text)`, `plain_text(text)`, `with_range(range)`, `to_json` |
+| `MarkupKind` | `as_str()` (`"plaintext"`, `"markdown"`); default `Markdown` |
+| `TextEdit` | `new(range, new_text)`, `to_json`, `from_json` |
 
 ```rust
-use lsp_lang::{json, Reply};
+use lsp_lang::{Hover, Location, Position, Range};
 
-let reply = Reply::new(&json!({ "contents": "a number" }))?;
-assert_eq!(reply.as_str(), r#"{"contents":"a number"}"#);
-# Ok::<(), lsp_lang::Error>(())
+let range = Range::new(Position::new(0, 8), Position::new(0, 13));
+let hover = Hover::markdown("`width`: defined on line 1").with_range(range);
+assert_eq!(hover.to_json()["contents"]["kind"], "markdown");
+assert_eq!(Location::new("file:///a", range).to_json()["uri"], "file:///a");
 ```
 
-```rust
-use lsp_lang::{Position, Range, Reply};
-
-// Typed results serialize without a `Value` in between.
-#[derive(serde::Serialize)]
-struct TextEdit { range: Range, #[serde(rename = "newText")] new_text: String }
-
-let edits = vec![TextEdit {
-    range: Range::new(Position::new(0, 0), Position::new(0, 3)),
-    new_text: "let".into(),
-}];
-let reply = Reply::new(&edits)?;
-assert!(reply.as_str().starts_with(r#"[{"range":{"start":{"line":0"#));
-# Ok::<(), lsp_lang::Error>(())
-```
-
-### `Reply::null`
+## `CompletionItem`, `CompletionItemKind`
 
 ```rust,ignore
-pub const fn null() -> Reply
+#[non_exhaustive] pub struct CompletionItem {
+    pub label: String, pub kind: Option<CompletionItemKind>, pub detail: Option<String>,
+    pub documentation: Option<String>, pub sort_text: Option<String>,
+    pub filter_text: Option<String>, pub insert_text: Option<String>,
+    pub text_edit: Option<TextEdit>,
+}
+#[non_exhaustive] pub enum CompletionItemKind { Text = 1, Method, Function, /* ... */ TypeParameter = 25 }
 ```
 
-The `null` result, without allocating — the protocol's "nothing here": no
-hover at the position, no definition found.
+Only `label` is required. Build an item with `CompletionItem::new(label)` and
+chain `with_kind`, `with_detail`, `with_documentation` (Markdown),
+`with_sort_text`, `with_filter_text`, `with_insert_text`, `with_text_edit`;
+`to_json` gives the protocol's JSON. `CompletionItemKind::as_u32` gives the
+protocol's number.
 
 ```rust
-use lsp_lang::Reply;
+use lsp_lang::{CompletionItem, CompletionItemKind};
 
-assert_eq!(Reply::null().as_str(), "null");
-assert_eq!(Reply::null(), Reply::new(&None::<u32>).unwrap());
+let item = CompletionItem::new("define")
+    .with_kind(CompletionItemKind::Keyword)
+    .with_detail("(define name value)");
+assert_eq!(item.to_json()["kind"], 14);
 ```
 
-### `Reply::as_str`
+## `DocumentSymbol`, `SymbolKind`
 
 ```rust,ignore
-pub fn as_str(&self) -> &str
+#[non_exhaustive] pub struct DocumentSymbol {
+    pub name: String, pub detail: Option<String>, pub kind: SymbolKind,
+    pub range: Range, pub selection_range: Range, pub children: Vec<DocumentSymbol>,
+}
+#[non_exhaustive] pub enum SymbolKind { File = 1, Module, /* ... */ TypeParameter = 26 }
 ```
 
-The serialized JSON.
+One entry of the outline, with the entries nested inside it. `range` covers the
+whole symbol and `selection_range` the part to highlight; the protocol requires
+the selection to lie inside the range, and clients reject the whole answer
+otherwise, so the server clamps `selection_range` into `range` when it writes
+the symbol. `DocumentSymbol::new(name, kind, range, selection_range)`,
+`with_detail`, `with_child`, and `to_json` build and convert; `SymbolKind::as_u32`
+gives the protocol's number.
+
+A symbol tree can be as deep as the source. Writing, cloning, and dropping it
+never recurse: each walks an explicit stack, so depth costs memory and not call
+stack. `Debug` and `PartialEq` follow the nesting and are meant for realistic
+depths.
 
 ```rust
-use lsp_lang::Reply;
+use lsp_lang::{DocumentSymbol, Position, Range, SymbolKind};
 
-assert_eq!(Reply::new(&[1, 2, 3])?.as_str(), "[1,2,3]");
-# Ok::<(), lsp_lang::Error>(())
+let line = |n| Range::new(Position::new(n, 0), Position::new(n, 20));
+let class = DocumentSymbol::new("Shape", SymbolKind::Class, line(0), line(0))
+    .with_child(DocumentSymbol::new("area", SymbolKind::Method, line(1), line(1)));
+assert_eq!(class.to_json()["children"][0]["name"], "area");
+```
+
+## Semantic tokens
+
+### `SemanticTokensLegend`
+
+```rust,ignore
+pub struct SemanticTokensLegend { pub token_types: Vec<String>, pub token_modifiers: Vec<String> }
+```
+
+The token types and modifiers a server uses; a token's type is an index into
+`token_types` and its modifiers a bit mask over `token_modifiers`.
+
+| Method | |
+|---|---|
+| `new(&[&str], &[&str])` | A legend of these types and modifiers. |
+| `standard()` | LSP 3.17's standard type names (`namespace` … `decorator`) and modifier names (`declaration` … `defaultLibrary`), in the protocol's order. |
+| `token_type(name) -> Option<u32>` | The index of a type, to put in a token. |
+| `modifier(name) -> Option<u32>` | The bit of a modifier, to OR into a token's modifiers; `None` for an unknown name or one past 32. |
+| `to_json()` | The protocol's JSON. |
+
+### `SemanticTokens`
+
+```rust,ignore
+pub struct SemanticTokens { /* private */ }
+```
+
+A document's tokens, delta-encoded: five integers per token (line delta, column
+delta, length, type, modifiers). `from_data(Vec<u32>)` wraps already-encoded
+data (the server refuses a length that is not a multiple of five, answering the
+request with `InternalError`); `data()`, `len()` (tokens), `is_empty()`,
+`result_id()` (assigned by the server), and `to_json()` read it.
+
+### `SemanticTokensBuilder`
+
+```rust,ignore
+pub struct SemanticTokensBuilder<'d, G: Grammar> { /* private */ }
+```
+
+Collects tokens by byte span and encodes them: `new(&Document<G>)`,
+`push(Span, token_type: u32, modifiers: u32)`, `len()`, `is_empty()`, and
+`build() -> SemanticTokens`. Tokens may be pushed in any order. `build` sorts
+them, drops a token that overlaps an earlier one (the protocol allows no
+overlaps) or is empty, clamps spans to the text and to character boundaries,
+converts to lines and columns in the session encoding (a UTF-16 session counts
+a surrogate pair as two), and splits a token that crosses a line break into one
+token per line, which every client accepts. Cost: `O(n log n)` in the number of
+tokens, plus the text they cover.
+
+```rust
+# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
+# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+# enum K { Root, Text }
+# impl TokenKind for K {}
+# #[derive(Clone)]
+# struct Plain;
+# impl Grammar for Plain {
+#     type Kind = K;
+#     const ROOT: K = K::Root;
+#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
+#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
+#     }
+#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
+#         b.start(K::Root);
+#         while !b.at_end() { b.bump(); }
+#         b.finish();
+#     }
+# }
+use lsp_lang::{Context, Document, Features, Handler, ResponseError};
+use lsp_lang::{SemanticTokens, SemanticTokensBuilder, SemanticTokensLegend};
+
+/// Highlights every `fn` as a keyword.
+struct Keywords(SemanticTokensLegend);
+
+impl Handler<Plain> for Keywords {
+    fn features(&self) -> Features {
+        Features::new().semantic_tokens(self.0.clone())
+    }
+
+    fn semantic_tokens(&mut self, doc: &Document<Plain>, _: &mut Context<'_, Plain>)
+        -> Result<SemanticTokens, ResponseError>
+    {
+        let keyword = self.0.token_type("keyword").unwrap_or(0);
+        let mut tokens = SemanticTokensBuilder::new(doc);
+        for (at, _) in doc.text().match_indices("fn") {
+            tokens.push(Span::new(at as u32, at as u32 + 2), keyword, 0);
+        }
+        Ok(tokens.build())
+    }
+}
 ```
 
 ## `ResponseError`
 
 ```rust,ignore
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ResponseError { /* private */ }
-
-impl ResponseError {
-    pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
-    pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
-    pub const INTERNAL_ERROR: i32 = -32603;
-    pub const SERVER_NOT_INITIALIZED: i32 = -32002;
-    pub const REQUEST_FAILED: i32 = -32803;
-    pub const SERVER_CANCELLED: i32 = -32802;
-    pub const CONTENT_MODIFIED: i32 = -32801;
-    pub const REQUEST_CANCELLED: i32 = -32800;
-
-    pub fn new(code: i32, message: impl Into<String>) -> ResponseError;
-    pub const fn code(&self) -> i32;
-    pub fn message(&self) -> &str;
-}
-
-impl From<Error> for ResponseError;      // INTERNAL_ERROR
-impl Display for ResponseError;          // "message (code N)"
-impl std::error::Error for ResponseError;
+pub struct ResponseError { /* code: i32, message, data */ }
 ```
 
-A JSON-RPC error: a request's failure, sent to the client in place of a result.
+A JSON-RPC error, the failed outcome of a request. `ResponseError::new(code,
+message)`, `with_data(Value<'static>)`, `code()`, `message()`, `data()`.
+`Display` is `"<message> (code <code>)"`. The associated constants are the
+codes JSON-RPC and the protocol define:
 
-| Code | Constant | Meaning — and who sends it |
-|---|---|---|
-| -32700 | `PARSE_ERROR` | The message was not valid JSON. The server. |
-| -32600 | `INVALID_REQUEST` | Not a valid request (wrong shape, `initialize` twice, a request after `shutdown`). The server. |
-| -32601 | `METHOD_NOT_FOUND` | The method is not supported. The default [`Handler::request`](#handlerrequest). |
-| -32602 | `INVALID_PARAMS` | The parameters are invalid. [`Json::parse`](#jsonparse). |
-| -32603 | `INTERNAL_ERROR` | Something failed inside the server, such as serializing the result. |
-| -32002 | `SERVER_NOT_INITIALIZED` | A request arrived before `initialize`. The server. |
-| -32803 | `REQUEST_FAILED` | The request was understood but could not be served; the message says why. |
-| -32802 | `SERVER_CANCELLED` | The server cancelled the request; the client may retry. |
-| -32801 | `CONTENT_MODIFIED` | The document changed during the request; the client should retry against the new text. |
-| -32800 | `REQUEST_CANCELLED` | The client cancelled the request. |
+| Constant | Code | Meaning |
+|---|---:|---|
+| `PARSE_ERROR` | -32700 | Invalid JSON. Sent by the server. |
+| `INVALID_REQUEST` | -32600 | Not a valid request object. |
+| `METHOD_NOT_FOUND` | -32601 | The default answer of unimplemented handler methods. |
+| `INVALID_PARAMS` | -32602 | What the `from_json` conversions return on a mismatch. |
+| `INTERNAL_ERROR` | -32603 | A handler panicked, or the server could not write a result. |
+| `SERVER_NOT_INITIALIZED` | -32002 | A request arrived before `initialize`. |
+| `REQUEST_FAILED` | -32803 | Understood but could not be served. |
+| `SERVER_CANCELLED` | -32802 | The server cancelled the request; retry. |
+| `CONTENT_MODIFIED` | -32801 | The document changed while serving; retry against the new content. |
+| `REQUEST_CANCELLED` | -32800 | The client cancelled the request. |
 
-| Method | Meaning |
-|---|---|
-| `new(code, message)` | Builds an error. Some clients show the message to the user: say what failed and what to do. |
-| `code()` | The error code. |
-| `message()` | The message. |
-
-```rust
-use lsp_lang::ResponseError;
-
-let err = ResponseError::new(ResponseError::REQUEST_FAILED, "no project loaded");
-assert_eq!(err.code(), -32803);
-assert_eq!(err.message(), "no project loaded");
-assert_eq!(err.to_string(), "no project loaded (code -32803)");
-```
-
-```rust
-use lsp_lang::{Error, ResponseError};
-
-// A library error becomes an internal error response.
-let err: ResponseError = Error::Disconnected.into();
-assert_eq!(err.code(), ResponseError::INTERNAL_ERROR);
-```
-
-## `Position`
-
-```rust,ignore
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-pub struct Position {
-    pub line: u32,
-    pub character: u32,
-}
-
-impl Position {
-    pub const fn new(line: u32, character: u32) -> Position;
-}
-```
-
-A place in a document: a zero-based line and a zero-based column in the
-session's [encoding](#encoding). Serializes as the protocol's
-`{"line":…,"character":…}`, so it can sit directly in parameter and result
-types. Orders by line, then column.
-
-| Field | Meaning |
-|---|---|
-| `line` | Zero-based line. Lines end at `\n`, `\r\n`, or a lone `\r`. |
-| `character` | Zero-based column, in the session's encoding. |
-
-```rust
-use lsp_lang::Position;
-
-let a = Position::new(2, 4);
-assert!(a < Position::new(3, 0));
-assert_eq!(lsp_lang::serde_json::to_string(&a).unwrap(), r#"{"line":2,"character":4}"#);
-```
-
-```rust
-use lsp_lang::{Json, Position};
-
-#[derive(serde::Deserialize)]
-struct Cursor { position: Position }
-
-let c: Cursor = Json::from_raw(r#"{"position":{"line":1,"character":7}}"#).parse()?;
-assert_eq!(c.position, Position::new(1, 7));
-# Ok::<(), lsp_lang::ResponseError>(())
-```
-
-## `Range`
-
-```rust,ignore
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Range {
-    pub start: Position,
-    pub end: Position,
-}
-
-impl Range {
-    pub const fn new(start: Position, end: Position) -> Range;
-}
-```
-
-A stretch of a document: `start` inclusive, `end` exclusive. An empty range
-marks a point. Serializes as `{"start":…,"end":…}`.
-
-| Field | Meaning |
-|---|---|
-| `start` | Where the range begins. |
-| `end` | Where it ends (exclusive). |
-
-```rust
-use lsp_lang::{Position, Range};
-
-let word = Range::new(Position::new(0, 4), Position::new(0, 9));
-assert_eq!(
-    lsp_lang::serde_json::to_string(&word).unwrap(),
-    r#"{"start":{"line":0,"character":4},"end":{"line":0,"character":9}}"#
-);
-```
-
-```rust
-use lsp_lang::{Position, Range};
-
-let cursor = Range::new(Position::new(3, 1), Position::new(3, 1));
-assert_eq!(cursor.start, cursor.end); // a point
-assert_eq!(Range::default(), Range::new(Position::default(), Position::default()));
-```
-
-## `Encoding`
-
-```rust,ignore
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum Encoding {
-    Utf8,
-    #[default]
-    Utf16,
-}
-```
-
-The unit [`Position`](#position) columns are counted in, negotiated at
-`initialize` (see [Positions and encodings](#positions-and-encodings)).
-
-| Variant | Protocol name | Unit | `é` | `😀` |
-|---|---|---|---|---|
-| `Utf8` | `"utf-8"` | bytes | 2 | 4 |
-| `Utf16` | `"utf-16"` | UTF-16 code units (the default) | 1 | 2 |
-
-`#[non_exhaustive]`: match it with a wildcard arm.
-
-```rust
-use lsp_lang::Encoding;
-
-assert_eq!(Encoding::default(), Encoding::Utf16);
-```
-
-```rust
-use lsp_lang::incremental_lang::Grammar;
-use lsp_lang::{Document, Encoding};
-
-fn describe<G: Grammar>(doc: &Document<G>) -> &'static str {
-    match doc.encoding() {
-        Encoding::Utf8 => "byte columns",
-        Encoding::Utf16 => "UTF-16 columns",
-        _ => "other",
-    }
-}
-```
+Conversions: `From<Error>` (an `INTERNAL_ERROR`), `From<jsonx_lib::Error>` (an
+`INVALID_PARAMS`), and to and from `rpc_io::ErrorObject`.
 
 ## `Error`
 
 ```rust,ignore
-#[derive(Debug)]
 #[non_exhaustive]
-pub enum Error {
-    Io(std::io::Error),
-    Disconnected,
-    InvalidHeader { reason: &'static str },
-    TooLarge { len: usize, limit: usize },
-    ExitWithoutShutdown,
-    Json(serde_json::Error),
-}
-
-impl Display for Error;
-impl std::error::Error for Error;   // source(): the wrapped Io or Json error
-impl From<std::io::Error> for Error;
+pub enum Error { Io(io::Error), Disconnected, Frame(FrameError), ExitWithoutShutdown, Closed, InvalidParams(Kind) }
 ```
 
-Something went wrong in the server itself, as opposed to a request that failed
-(a [`ResponseError`](#responseerror)).
-
-| Variant | Meaning | What to do |
-|---|---|---|
-| `Io(e)` | Reading from or writing to the client failed. | Exit; the connection is broken. |
-| `Disconnected` | The input ended before `exit`, or partway through a message. | Exit; the editor is gone. |
-| `InvalidHeader { reason }` | A header was malformed (no `Content-Length`, a bad length, an over-long or excessive header). The stream cannot be split into messages any more. | Exit. |
-| `TooLarge { len, limit }` | A message announced a body over the [limit](#serverwith_message_limit). Its body was not read. | Exit, or raise the limit. |
-| `ExitWithoutShutdown` | `exit` came without `shutdown`. | Exit with status 1, as the protocol asks. |
-| `Json(e)` | A handler's value failed to serialize ([`Reply::new`](#replynew), [`Context::notify`](#contextnotify), [`Context::request`](#contextrequest)). Nothing was sent; the session goes on. | Fix the value's `Serialize`; in a request, `?` reports it as `INTERNAL_ERROR`. |
-
-`#[non_exhaustive]`: match it with a wildcard arm.
+Something went wrong in the server itself, as opposed to a request that failed.
+`Io`, `Disconnected`, `Frame`, and `ExitWithoutShutdown` end
+[`Server::run`](#serverrun); in every case the right response is to exit non-zero.
+`Closed` and `InvalidParams` describe a single send from a handler
+([`notify`](#contextnotify), [`request`](#contextrequest)) and never end the
+session. `FrameError` is [`rpc_io::FrameError`](https://docs.rs/rpc-io); `Kind`
+is [`jsonx_lib::Kind`](https://docs.rs/jsonx-lib). `Error` implements
+`std::error::Error`, with `source()` for `Io` and `Frame`.
 
 ```rust
 use lsp_lang::Error;
 
-fn exit_code(result: Result<(), Error>) -> u8 {
+fn exit_code(result: Result<(), Error>) -> i32 {
     match result {
         Ok(()) => 0,
-        Err(Error::ExitWithoutShutdown) => 1,
-        Err(err) => {
-            eprintln!("language server stopped: {err}");
-            1
-        }
+        Err(_) => 1,
     }
 }
-assert_eq!(exit_code(Ok(())), 0);
-assert_eq!(exit_code(Err(Error::Disconnected)), 1);
-```
-
-```rust
-use std::error::Error as _;
-use lsp_lang::Error;
-
-let err = Error::from(std::io::Error::other("pipe closed"));
-assert!(err.to_string().contains("pipe closed"));
-assert!(err.source().is_some());
+assert_eq!(exit_code(Err(Error::ExitWithoutShutdown)), 1);
 ```
 
 ## Re-exports
@@ -2242,11 +1374,12 @@ assert!(err.source().is_some());
 | `lsp_lang::incremental_lang` | [`incremental-lang`](https://docs.rs/incremental-lang) | The `Grammar`, `Builder`, `Token`, `Span`, and `Tree` a server's grammar is written with. |
 | `lsp_lang::diag_lang` | [`diag-lang`](https://docs.rs/diag-lang) | `Label` and `Severity`, to build diagnostics. |
 | `lsp_lang::Diagnostic` | `diag-lang` | What [`publish_diagnostics`](#contextpublish_diagnostics) takes. |
-| `lsp_lang::serde_json` | [`serde_json`](https://docs.rs/serde_json) | JSON for capabilities, parameters, and results. |
-| `lsp_lang::Value`, `lsp_lang::json!` | `serde_json` | What [`Handler::initialize`](#handlerinitialize) returns; a quick way to build any JSON. |
+| `lsp_lang::jsonx_lib` | [`jsonx-lib`](https://docs.rs/jsonx-lib) | The JSON: parsing, `Value`, and the writer. |
+| `lsp_lang::Value`, `lsp_lang::json!` | `jsonx-lib` | What handlers read parameters as and answer custom requests with; a quick way to build any JSON. |
+| `lsp_lang::rpc_io` | [`rpc-io`](https://docs.rs/rpc-io) | `Json`, `Raw`, and `FrameError`, the transport types in this API. |
 
-Re-exporting means a server needs only `lsp-lang` (plus `serde`, to derive)
-and always gets the versions lsp-lang was built against.
+Re-exporting means a server needs only `lsp-lang` and always gets the versions
+lsp-lang was built against.
 
 ```rust
 use lsp_lang::diag_lang::{Label, Severity};
@@ -2261,68 +1394,73 @@ assert_eq!(caps["hoverProvider"], true);
 
 ## Stability
 
-As of `1.0.0` the public API is frozen. lsp-lang follows
-[Semantic Versioning](https://semver.org/); within the `1.x` series:
+As of `2.0.0` the public API is frozen, on the family's rule that a major
+release freezes the surface it ships. lsp-lang follows
+[Semantic Versioning](https://semver.org/); within the `2.x` series:
 
-- The **surface** will not change in a breaking way:
-  [`Server`](#server) (`new`, `with_message_limit`, `handler`, `run`),
-  [`Handler`](#handler) (`initialize`, `changed`, `closed`, `request`,
-  `notification`, `response`, each with its default),
-  [`Context`](#context) (`document`, `documents`, `notify`, `request`,
-  `publish_diagnostics`, `clear_diagnostics`),
-  [`Document`](#document) (`uri`, `version`, `text`, `tree`, `incremental`,
-  `encoding`, `position`, `offset`, `range`, `span`),
-  [`Json`](#json) (`from_raw`, `parse`, `as_str`), [`Reply`](#reply) (`new`,
-  `null`, `as_str`), [`ResponseError`](#responseerror) (its constants, `new`,
-  `code`, `message`, `From<Error>`), [`Position`](#position) and
-  [`Range`](#range) (fields, `new`, serde shape), [`Encoding`](#encoding),
-  [`Error`](#error), and the [re-exports](#re-exports). New items, new
-  `Handler` methods (always with a default), and new methods on existing types
-  are minor additions; a breaking change means a new major version.
+- The **surface** will not change in a breaking way: every item and method in
+  this document, with the defaults of the `Handler` methods. New items, new
+  `Handler` methods (always with a default), new `Features` builders, and new
+  methods on existing types are minor additions; a breaking change means a new
+  major version. `Encoding`, `Error`, `MessageType`, `MarkupKind`,
+  `CompletionItemKind`, `SymbolKind`, `Hover`, `CompletionItem`, and
+  `DocumentSymbol` are `#[non_exhaustive]`, so variants and fields can be added
+  in a minor release; match enums with a wildcard arm.
 - The **lifecycle** is fixed as described in [The session
   lifecycle](#the-session-lifecycle): which requests and notifications reach the
   handler in each phase, the error codes the server answers with, and the
   outcome of [`run`](#serverrun) for each way a session ends.
-- The **capabilities the server owns** are fixed: it adds `positionEncoding`
-  and sets `textDocumentSync.openClose` to `true` and `textDocumentSync.change`
-  to incremental, keeping every other member the handler returns.
-- **Encoding negotiation** is fixed: UTF-8 when the client offers it,
-  otherwise UTF-16. Offering more encodings in a later release would only ever
-  apply to clients that offer neither.
+- The **capabilities** are fixed: derived from [`Features`](#features) as
+  described there, plus the server's own `positionEncoding` and
+  `textDocumentSync` (`openClose: true`, `change: 2`).
+- **Encoding negotiation** is fixed: UTF-8 when the client offers it, otherwise
+  UTF-16. Offering more encodings in a later release would only ever apply to
+  clients that offer neither.
 - **Position conversion** is fixed: the line breaks (`\n`, `\r\n`, lone `\r`),
   the clamping rules, and the snapping of a column inside a character to its
-  start, as described in [Positions and encodings](#positions-and-encodings).
-- The **diagnostics mapping** in [Diagnostics](#diagnostics-mapping) is fixed:
-  which part of a `Diagnostic` becomes which protocol field, the severity
-  mapping, and the order of the message's lines.
+  start.
+- The **diagnostics mapping** is fixed: which part of a `Diagnostic` becomes
+  which protocol field, the severity mapping, and the order of the message's
+  lines.
 - **Document synchronization** is fixed: every edit of a `didChange` is applied
-  in order before one [`changed`](#handlerchanged) call; a change that cannot
-  be applied keeps the document at its last good state, out of step, until a
-  whole-text change or a reopen, as described in
-  [Document synchronization](#document-synchronization). (Revised in 1.0.1:
-  1.0.0 dropped the document and called [`closed`](#handlerclosed), which left
-  language features dead for that file until it was reopened.)
+  in order before one [`changed`](#handlerchanged) call; a change that cannot be
+  applied keeps the document at its last good state, out of step, until a
+  whole-text change or a reopen.
+- **Semantic tokens** are fixed: the builder's rules (sorting, dropping overlaps
+  and empty tokens, splitting at line breaks, the session encoding's lengths),
+  the single token-aligned edit of a delta, and the answer in full for an unknown
+  `previousResultId`. **Symbols**: the selection range is clamped into the range.
+- **Cancellation** is fixed as described in [Cancellation](#cancellation): a
+  request received and not yet started is cancelled with `REQUEST_CANCELLED` and
+  never reaches the handler; a running handler is not interrupted.
 - **Ordering** is fixed: messages a handler sends go out in the order sent,
-  before the response to the request being handled, all before the next
-  incoming message is read — except during `initialize`, whose response goes
-  first (revised in 1.0.1, as the protocol requires). Ids from
-  [`Context::request`](#contextrequest) count up from 0 in each session.
-- **Containment** is fixed (since 1.0.1): a panic in the grammar or the
-  handler never ends the session where panics unwind; at most 1024 of the
-  server's requests are outstanding, the oldest cancelled first.
-- `Encoding` and `Error` are `#[non_exhaustive]`, so variants can be added in a
-  minor release; match them with a wildcard arm.
-- `incremental-lang`, `diag-lang`, `serde_json`, and `serde` are **public
+  before the response to the request being handled, all before the next incoming
+  message is read, except during `initialize`, whose response goes first. Ids
+  from [`Context::request`](#contextrequest) count up from 1 in each session.
+- **Containment** is fixed: a panic in the grammar or the handler never ends the
+  session where panics unwind; at most 1024 of the server's requests are
+  outstanding, the oldest cancelled first.
+- `incremental-lang`, `diag-lang`, `jsonx-lib`, and `rpc-io` are **public
   dependencies**: their types appear in this API (`Grammar`, `Tree`, `Span`,
-  `Diagnostic`, `Value`, the `Serialize`/`Deserialize` bounds). Moving to a new
+  `Diagnostic`, `Value`, `Json`, `Raw`, `FrameError`, `Kind`). Moving to a new
   major version of any of them would be a major release here.
 - MSRV (Rust 1.85) is a compatibility surface: raising it is a documented minor
   change, never a patch.
 
+**Honest limits of this freeze.** `jsonx-lib` and `rpc-io` are at `0.2` as of
+this release, not `1.0`, and their types are in this API: the freeze here
+promises lsp-lang's own surface, and a breaking change in either dependency
+before it reaches `1.0` would be absorbed by a lsp-lang major release rather
+than hidden. The typed JSON conversions are inherent `to_json`/`from_json`
+methods because `jsonx-lib` does not yet have `ToJson`/`FromJson` traits; if
+it adds them, lsp-lang will implement them in a minor release alongside the
+methods, which stay. `Handler::features` is an explicit declaration, not
+something inferred from which methods were overridden (Rust cannot see that).
+
 What is **not** promised: the wording of error messages, `window/logMessage`
-text, and `Display` output; the `Debug` output of any type; the order of keys
-and the whitespace in the JSON the server writes (it is valid JSON, but compare
-values, not text); the default message limit; and performance figures — the
+text, and `Display` output; the `Debug` output of any type; the order of keys and
+the whitespace in the JSON the server writes (it is valid JSON, but compare
+values, not text); the default message limit; and performance figures: the
 benchmarks are tracked, but they are measurements, not guarantees.
 
 See [`../dev/ROADMAP.md`](../dev/ROADMAP.md) and

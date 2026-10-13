@@ -21,6 +21,156 @@
 
 ---
 
+## [2.0.0] - 2026-10-13
+
+A major release. lsp-lang is rebuilt on the family's own stack: the transport is
+[`rpc-io`](https://crates.io/crates/rpc-io) (JSON-RPC 2.0, the base protocol's
+`Content-Length` framing, id correlation, `$/cancelRequest`) and the JSON is
+[`jsonx-lib`](https://crates.io/crates/jsonx-lib). `serde`, `serde_json` (which
+1.x re-exported in its public API), and `memchr` are gone: the crate now has no
+third-party dependencies. Everything 1.x did is kept and ported (the
+lifecycle, document synchronization, incremental sync through
+`incremental-lang`, `diag-lang` diagnostics, the robustness fixes of 1.0.1),
+and the typed features a language needs first are added: semantic tokens (full
+and delta), hierarchical document symbols, go to definition, hover, and
+completion, with `$/cancelRequest` that cancels.
+
+### Breaking
+
+- `serde_json` is no longer re-exported. `lsp_lang::serde_json`, and the
+  `Value` and `json!` that came from it, are replaced by `lsp_lang::jsonx_lib`
+  and its `Value<'a>` and `json!`. A `jsonx_lib::Value` borrows from the text it
+  was parsed from; call `into_owned()` for a `Value<'static>`.
+- `Handler::initialize` returns `Result<(), ResponseError>` instead of the
+  capabilities, and takes `&Value<'_>` instead of `Json<'_>`. Capabilities are
+  derived from the new `Handler::features`.
+- `Handler::request`, `notification`, and `response` take and return
+  `jsonx_lib` values: `request(method, &Value<'_>, cx) -> Result<Value<'static>,
+  ResponseError>`, `notification(method, &Value<'_>, cx)`, and
+  `response(id, Result<Value<'_>, ResponseError>, cx)`.
+- `Handler::request` no longer receives every request. The typed requests go to
+  their own methods (`hover`, `definition`, `completion`, `document_symbols`,
+  `semantic_tokens`), and any other method must be registered with
+  `Server::custom_request`; an unregistered method is `MethodNotFound`.
+  `Handler::notification` receives the standard notifications and those
+  registered with `Server::custom_notification`; other notifications are
+  ignored.
+- `Json` and `Reply` are removed. Parameters are read from a `&Value`, and
+  results are typed values or a `Value<'static>`.
+- `Position` and `Range` no longer implement `Serialize`/`Deserialize`; use
+  `to_json()` and `from_json()`.
+- `Context::notify` and `Context::request` take `impl Into<rpc_io::Json>` (a
+  `json!(...)` value, or a `Raw`) instead of `&impl Serialize`. Params must be an
+  array, an object, or `()`, as JSON-RPC requires.
+- Ids of the server's own requests count from 1 (they counted from 0).
+- `Server::run` takes `R: Read` instead of `R: BufRead`. A `BufRead` is a `Read`,
+  so existing calls compile.
+- `Error` loses `InvalidHeader`, `TooLarge`, and `Json`, and gains `Frame`,
+  `Closed`, and `InvalidParams`. A message over the size limit no longer ends the
+  session with `TooLarge`: it is skipped as it arrives and refused with
+  `InvalidRequest` under a `null` id.
+- JSON-RPC is applied as the specification has it. A batch is answered with an
+  array (1.x refused every batch with `InvalidRequest`); scalar `params` is an
+  `InvalidRequest`; an error answer from the client with no message or a
+  non-integer code is an invalid response (`Handler::response` receives it as an
+  `INVALID_REQUEST` error; 1.x read it leniently).
+- Work is queued and run when the input has nothing more buffered, in order. A
+  client's answer to a server request can no longer be handled before the
+  `Handler` call that sent the request, which no real client can cause but a
+  script that pipelines an answer can.
+- After `shutdown`, a request for a method the server does not know is
+  `MethodNotFound`, not `InvalidRequest`.
+
+### Added
+
+- `Handler::features`, `Features`: what a handler offers (`hover`, `definition`,
+  `completion`, `document_symbols`, `semantic_tokens`, `capability`), from which
+  the `initialize` result is built. Features may depend on what `initialize`
+  learned.
+- Typed handler methods `hover`, `definition`, `completion`, `document_symbols`,
+  `semantic_tokens`, and the types they speak: `Hover`, `MarkupKind`, `Location`,
+  `TextEdit`, `CompletionItem`, `CompletionItemKind`, `DocumentSymbol`,
+  `SymbolKind`, `SemanticTokens`, `SemanticTokensLegend`, and
+  `SemanticTokensBuilder`. Every type has hand-written `to_json` (and
+  `from_json` where a handler reads it); there are no derives.
+- Semantic tokens: the builder sorts, drops overlaps and empty tokens, converts
+  byte spans to lines and columns in the session encoding (surrogate pairs
+  count as two in UTF-16), and splits multi-line tokens; the server assigns a
+  `resultId`, keeps the last answer per document, and answers
+  `semanticTokens/full/delta` with a single token-aligned edit (a full answer for
+  an unknown id).
+- Document symbols are written and dropped iteratively, so an outline as deep as
+  the source cannot overflow the stack; a selection range outside its range is
+  clamped into it.
+- `$/cancelRequest` cancels: a request received and not started is answered
+  `RequestCancelled` once and never reaches the handler.
+- `serve_stdio`, the one-call entry point; `Server::with_info` (`serverInfo`);
+  `Server::custom_request` and `Server::custom_notification`.
+- `Context::log` and `MessageType` (`window/logMessage`).
+- `ResponseError::with_data` and `ResponseError::data`; conversions to and from
+  `rpc_io::ErrorObject` and from `jsonx_lib::Error`.
+- `Position::to_json`/`from_json` and `Range::to_json`/`from_json`.
+- Re-exports of `jsonx_lib` and `rpc_io`.
+- The server tells the client (`window/logMessage`) about an answer that is not
+  a valid response, and about the client reporting that it could not read
+  something the server sent.
+- Tests: an in-memory-pipe conformance suite (messages split at every byte,
+  pipelined requests, hang-ups, a conversation with server-to-client requests),
+  feature tests (capabilities, outlines, semantic-token delta that applies back
+  to the full answer, cancellation including a request cancelled while another
+  runs), hostile-input tests (malformed JSON, wrong types, huge and 1,000,000-deep
+  messages, floods, broken framing, random bytes), and properties (UTF-16 and
+  UTF-8 position conversion including surrogate pairs and positions inside them,
+  semantic tokens against a reference encoding, the whole-session text and
+  tree invariants). Benchmarks for the typed features.
+
+### Removed
+
+- The dependencies `serde`, `serde_json`, and `memchr`. Line breaks are found by
+  an eight-bytes-at-a-time scan in safe Rust (`src/lines.rs`) instead of
+  `memchr`; the transport is `rpc-io`'s decoder instead of the hand-written
+  framing reader.
+- `Json`, `Reply`, `Error::InvalidHeader`, `Error::TooLarge`, `Error::Json`, and
+  the `serde_json` re-exports.
+
+### Changed
+
+- Everything written in one turn (a message or a queued job) still reaches the
+  client in one `write`; notifications the crate writes itself (diagnostics, log
+  lines) are framed directly into the output buffer once the session is running,
+  skipping the transport's validate-and-copy. Debug builds validate each one.
+- Cargo description and keywords describe the typed features.
+- `Handler` documentation lists the three groups of methods and when each is
+  called.
+
+- A request a handler sent during an `initialize` that then failed is no longer
+  forgotten: it is never sent, and its outcome is delivered to
+  `Handler::response` as `REQUEST_CANCELLED`, so a handler that tracks its
+  requests is not left waiting.
+
+### Migrating from 1.x
+
+| 1.x | 2.0 |
+|---|---|
+| `use lsp_lang::{serde_json, Value, json}` | `use lsp_lang::{jsonx_lib, Value, json}`; `Value<'a>` borrows, `into_owned()` for `'static`; `value["a"]["b"].as_str()` reads, never panics |
+| `fn initialize(&mut self, p: Json<'_>, cx) -> Result<Value, ResponseError>` returning `json!({ "hoverProvider": true })` | `fn initialize(&mut self, p: &Value<'_>, cx) -> Result<(), ResponseError>` plus `fn features(&self) -> Features { Features::new().hover() }`; other capabilities with `.capability("renameProvider", json!(true))` |
+| `fn request(&mut self, method: &str, p: Json<'_>, cx)` with `match method { "textDocument/hover" => … }` | override `hover(&mut self, doc, position, cx) -> Result<Option<Hover>, ResponseError>` and list `.hover()`; the same for `definition`, `completion`, `document_symbols`, `semantic_tokens` |
+| custom requests such as `"lsk/explain"` in `Handler::request` | `Server::new(g, h).custom_request("lsk/explain")`, answered by `request(&mut self, method, &Value<'_>, cx) -> Result<Value<'static>, ResponseError>` |
+| `let p: MyParams = params.parse()?` with `#[derive(Deserialize)]` | `params["textDocument"]["uri"].as_str()`, or `Position::from_json(&params["position"])?`; a missing member is `Value::Null`, so check with `ok_or_else` |
+| `Reply::new(&json!({ … }))?`, `Reply::null()` | return `Ok(json!({ … }))` / `Ok(Value::Null)` from `request`, or `Hover`, `Vec<Location>`, … from a typed method |
+| `cx.notify("m", &json!({ … }))?` | `cx.notify("m", json!({ … }))?` |
+| `cx.request("m", &json!({ … }))?` returning an id counted from 0 | `cx.request("m", json!({ … }))?`, ids count from 1 |
+| `fn response(&mut self, id: u64, r: Result<Json<'_>, ResponseError>, cx)` | `fn response(&mut self, id: u64, r: Result<Value<'_>, ResponseError>, cx)`; `r.map(\|v\| v.to_string())` for the text |
+| `serde_json::to_value(&position)`, `#[derive(Serialize)]` on a result containing `Position` | `position.to_json()`; build results with `json!` or the typed result types |
+| `Error::TooLarge { len, limit }` to detect an oversize message | not an error any more: the message is refused with `InvalidRequest`; match `Error::Frame(_)` for broken framing |
+| `Error::InvalidHeader { reason }` | `Error::Frame(rpc_io::FrameError)` |
+| `Error::Json(e)` from `Reply::new` or `notify` | gone; `notify` and `request` return `Error::InvalidParams(kind)` for scalar params, `Error::Closed` after the session ended |
+| `server.run(input, &mut out)` with `R: BufRead` | unchanged; `R` needs only `Read` |
+| `ResponseError::new(code, message)` | unchanged; `.with_data(value)` is new |
+| a client script that pipelines `initialize`, `initialized`, and an answer to a request the handler sends on `initialized` | send the answer after the request arrives (a real client always does); in a one-shot test script use the in-memory pipe pattern of `tests/support` |
+
+---
+
 ## [1.0.1] - 2026-10-08
 
 A robustness patch (ISSUES M74, M75). A failed edit no longer drops the
@@ -226,7 +376,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lsp-lang/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/jamesgober/lsp-lang/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/jamesgober/lsp-lang/compare/v1.0.1...v2.0.0
 [1.0.1]: https://github.com/jamesgober/lsp-lang/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/lsp-lang/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/jamesgober/lsp-lang/compare/v0.1.0...v0.2.0

@@ -193,6 +193,15 @@ impl<G: Grammar> Document<G> {
             .positions(self.source.text(), offsets, self.encoding, order, out);
     }
 
+    /// The width, in the session encoding, of the text between two byte
+    /// offsets on character boundaries.
+    pub(crate) fn width_of(&self, start: usize, end: usize) -> u32 {
+        let bytes = self.source.text().as_bytes();
+        bytes
+            .get(start..end)
+            .map_or(0, |slice| crate::lines::width(slice, self.encoding))
+    }
+
     /// Returns the document's URI, exactly as the client sent it.
     ///
     /// URIs are compared as opaque strings; the server does not normalize them.

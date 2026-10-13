@@ -1,12 +1,16 @@
-//! Properties of document synchronization that must hold for every edit
-//! sequence a client can send:
+//! Properties of document synchronization and position handling that must
+//! hold for every edit sequence a client can send:
 //!
 //! - after every `didChange`, the server's text equals the client's;
 //! - the incrementally maintained tree equals a fresh parse of that text;
 //! - converting any character boundary to a position and back is exact
 //!   (except between the `\r` and `\n` of one line break, which is not a caret
-//!   position);
+//!   position), in UTF-8 and in UTF-16, surrogate pairs included;
+//! - a position that falls inside a surrogate pair, or past the end of its
+//!   line, converts to a character boundary at or before it, never a panic;
 //! - published diagnostics are well-formed JSON with ranges inside the text;
+//! - semantic tokens decode to the tokens that were pushed, sorted, split at
+//!   line breaks, and measured in the session encoding;
 //! - the server never reports a text the client did not have at that
 //!   version: a change it cannot place (a line the document lacks, a version
 //!   that does not increase) takes the document out of step, and nothing is
@@ -24,8 +28,10 @@ mod common;
 use std::sync::Once;
 
 use common::{Client, Kind, Lisp, LispServer, messages};
-use lsp_lang::incremental_lang::{Builder, Document as Incremental, Grammar, Token};
-use lsp_lang::{Context, Document, Handler, Position, Server, Value, json};
+use lsp_lang::incremental_lang::{Builder, Document as Incremental, Grammar, Span, Token};
+use lsp_lang::{
+    Context, Document, Encoding, Handler, Position, SemanticTokensBuilder, Server, Value, json,
+};
 use proptest::prelude::*;
 
 const URI: &str = "file:///p.lisp";
@@ -83,11 +89,17 @@ struct Checker {
     texts: Vec<String>,
     versions: Vec<i32>,
     failures: Vec<String>,
+    /// Positions to convert on every change, whatever the text: lines and
+    /// columns that may be inside a character or past the end of anything.
+    probes: Vec<Position>,
+    /// Byte-offset spans to turn into semantic tokens on every change.
+    spans: Vec<(usize, usize)>,
 }
 
 impl<G: Grammar<Kind = Kind>> Handler<G> for Checker {
     fn changed(&mut self, doc: &Document<G>, _: &mut Context<'_, G>) {
         let text = doc.text();
+        let utf8 = doc.encoding() == Encoding::Utf8;
         match Incremental::new(Lisp, text) {
             Ok(fresh) if fresh.tree() == doc.tree() => {}
             _ => self
@@ -96,7 +108,7 @@ impl<G: Grammar<Kind = Kind>> Handler<G> for Checker {
         }
         for offset in (0..=text.len()).filter(|&o| text.is_char_boundary(o)) {
             let pos = doc.position(offset as u32);
-            let model = model_position(text, offset, doc.encoding() == lsp_lang::Encoding::Utf8);
+            let model = model_position(text, offset, utf8);
             if pos != model && !inside_crlf(text, offset) {
                 self.failures.push(format!(
                     "position({offset}) = {pos:?}, model {model:?} in {text:?}"
@@ -108,9 +120,117 @@ impl<G: Grammar<Kind = Kind>> Handler<G> for Checker {
                 ));
             }
         }
+        for &probe in &self.probes {
+            let offset = doc.offset(probe) as usize;
+            if offset > text.len() || !text.is_char_boundary(offset) {
+                self.failures.push(format!(
+                    "offset({probe:?}) = {offset} is not a boundary in {text:?}"
+                ));
+                continue;
+            }
+            // Rounding down: the position of the result never passes the probe.
+            if doc.position(offset as u32) > probe && probe.line as usize <= text.lines().count() {
+                self.failures.push(format!(
+                    "offset({probe:?}) = {offset} rounds up in {text:?}"
+                ));
+            }
+        }
+        self.check_tokens(doc);
         self.texts.push(text.to_owned());
         self.versions.push(doc.version());
     }
+}
+
+impl Checker {
+    /// Builds tokens from `self.spans` and compares their decoding with a
+    /// reference computed from the text.
+    fn check_tokens<G: Grammar>(&mut self, doc: &Document<G>) {
+        if self.spans.is_empty() {
+            return;
+        }
+        let text = doc.text();
+        let utf8 = doc.encoding() == Encoding::Utf8;
+        let mut builder = SemanticTokensBuilder::new(doc);
+        let mut spans = Vec::new();
+        for (i, &(a, b)) in self.spans.iter().enumerate() {
+            let (a, b) = (floor(text, a.min(b)), floor(text, a.max(b)));
+            builder.push(Span::new(a as u32, b as u32), (i % 4) as u32, 1 << (i % 3));
+            spans.push((a, b, (i % 4) as u32, 1u32 << (i % 3)));
+        }
+        let got = decode(builder.build().data());
+        let want = reference_tokens(text, &spans, utf8);
+        if got != want {
+            self.failures
+                .push(format!("tokens {got:?} != reference {want:?} in {text:?}"));
+        }
+    }
+}
+
+/// Absolute `(line, column, length, type, modifiers)` from delta-encoded data.
+fn decode(data: &[u32]) -> Vec<(u32, u32, u32, u32, u32)> {
+    let (mut line, mut column) = (0u32, 0u32);
+    data.chunks_exact(5)
+        .map(|t| {
+            line += t[0];
+            column = if t[0] == 0 { column + t[1] } else { t[1] };
+            (line, column, t[2], t[3], t[4])
+        })
+        .collect()
+}
+
+/// What the tokens must decode to, from the protocol's rules alone: sorted by
+/// start, overlaps and empty tokens dropped, split at every line break, each
+/// piece placed and measured by the naive position model.
+fn reference_tokens(
+    text: &str,
+    spans: &[(usize, usize, u32, u32)],
+    utf8: bool,
+) -> Vec<(u32, u32, u32, u32, u32)> {
+    let mut spans = spans.to_vec();
+    spans.sort_by_key(|&(a, b, ..)| (a, b));
+    let mut out = Vec::new();
+    let mut covered = 0;
+    for (start, end, kind, modifiers) in spans {
+        if start >= end || start < covered {
+            continue;
+        }
+        covered = end;
+        let mut piece = start;
+        let mut i = start;
+        let bytes = text.as_bytes();
+        let mut emit = |from: usize, to: usize| {
+            if to > from {
+                let at = model_position(text, from, utf8);
+                let width = if utf8 {
+                    to - from
+                } else {
+                    text[from..to].encode_utf16().count()
+                };
+                out.push((at.line, at.character, width as u32, kind, modifiers));
+            }
+        };
+        while i < end {
+            match bytes[i] {
+                b'\n' => {
+                    emit(piece, i);
+                    i += 1;
+                    piece = i;
+                }
+                b'\r' => {
+                    emit(piece, i);
+                    i += if bytes.get(i + 1) == Some(&b'\n') {
+                        2
+                    } else {
+                        1
+                    };
+                    piece = i;
+                }
+                _ => i += 1,
+            }
+        }
+        emit(piece, end.min(i).max(piece));
+    }
+    out
 }
 
 /// The Lisp grammar with a bug in its fragment path: reparsing one list on
@@ -184,7 +304,7 @@ fn encode(
     changes: &[Option<(usize, usize, String)>],
     replacement: &str,
     utf8: bool,
-) -> Vec<Value> {
+) -> Vec<Value<'static>> {
     changes
         .iter()
         .map(|change| match change {
@@ -195,11 +315,11 @@ fn encode(
                     model_position(model, b, utf8),
                 );
                 model.replace_range(a..b, insert);
-                json!({ "range": { "start": start, "end": end }, "text": insert })
+                json!({ "range": { "start": start.to_json(), "end": end.to_json() }, "text": insert.clone() })
             }
             None => {
                 *model = replacement.to_owned();
-                json!({ "text": replacement })
+                json!({ "text": replacement.to_owned() })
             }
         })
         .collect()
@@ -264,20 +384,20 @@ proptest! {
                         let (a, b) = (floor(&text, *a.min(b)), floor(&text, *a.max(b)));
                         let (start, end) = (model_position(&text, a, false), model_position(&text, b, false));
                         text.replace_range(a..b, insert);
-                        content.push(json!({ "range": { "start": start, "end": end }, "text": insert }));
+                        content.push(json!({ "range": { "start": start.to_json(), "end": end.to_json() }, "text": insert.clone() }));
                     }
                     Step::Misplaced(insert) => {
                         let line = line_count(&text) + 1;
                         let at = Position::new(line, 0);
                         text.push_str(insert);
-                        content.push(json!({ "range": { "start": at, "end": at }, "text": insert }));
+                        content.push(json!({ "range": { "start": at.to_json(), "end": at.to_json() }, "text": insert.clone() }));
                         if applies {
                             placed = false;
                         }
                     }
                     Step::Whole => {
                         text.clone_from(&replacement);
-                        content.push(json!({ "text": replacement }));
+                        content.push(json!({ "text": replacement.clone() }));
                     }
                 }
             }
@@ -293,7 +413,7 @@ proptest! {
         // A final whole-text change always brings the document back.
         client.notify(
             "textDocument/didChange",
-            json!({ "textDocument": { "uri": URI, "version": version + 1 }, "contentChanges": [{ "text": replacement }] }),
+            json!({ "textDocument": { "uri": URI, "version": version + 1 }, "contentChanges": [{ "text": replacement.clone() }] }),
         );
         expected.push((version + 1, replacement.clone()));
         client.shutdown();
@@ -366,6 +486,43 @@ proptest! {
         let checker = server.handler();
         prop_assert_eq!(&checker.failures, &Vec::<String>::new());
         prop_assert_eq!(&checker.texts, &expected);
+    }
+
+    /// Positions anywhere (between the halves of a surrogate pair, past the
+    /// end of a line or of the text) convert to a character boundary at or
+    /// before them, in both encodings.
+    #[test]
+    fn prop_arbitrary_positions_convert_to_a_boundary_without_rounding_up(
+        text in text_strategy(),
+        probes in prop::collection::vec((0u32..8, 0u32..30), 1..16),
+        utf8 in any::<bool>(),
+    ) {
+        let mut client = Client::new();
+        client.initialize(if utf8 { &["utf-8"] } else { &["utf-16"] }).open(URI, &text);
+        client.shutdown();
+        let checker = Checker {
+            probes: probes.into_iter().map(|(l, c)| Position::new(l, c)).collect(),
+            ..Checker::default()
+        };
+        let mut server = Server::new(Lisp, checker);
+        prop_assert!(server.run(client.bytes(), Vec::new()).is_ok());
+        prop_assert_eq!(&server.handler().failures, &Vec::<String>::new());
+    }
+
+    /// Semantic tokens decode to what the protocol's rules say they should.
+    #[test]
+    fn prop_semantic_tokens_match_the_reference_encoding(
+        text in text_strategy(),
+        spans in prop::collection::vec((0usize..80, 0usize..80), 1..10),
+        utf8 in any::<bool>(),
+    ) {
+        let mut client = Client::new();
+        client.initialize(if utf8 { &["utf-8"] } else { &["utf-16"] }).open(URI, &text);
+        client.shutdown();
+        let checker = Checker { spans, ..Checker::default() };
+        let mut server = Server::new(Lisp, checker);
+        prop_assert!(server.run(client.bytes(), Vec::new()).is_ok());
+        prop_assert_eq!(&server.handler().failures, &Vec::<String>::new());
     }
 
     #[test]

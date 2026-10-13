@@ -1,19 +1,50 @@
 //! End-to-end behaviour of `Server`: lifecycle, framing, error responses,
-//! document synchronization, diagnostics, and server-to-client requests —
+//! document synchronization, diagnostics, and server-to-client requests,
 //! driven through byte streams exactly as an editor would.
+//!
+//! Most tests hand the server a complete script and read what it wrote. Tests
+//! that need a conversation (the server asks, the client answers) use the
+//! scripted client over pipes in `support`.
 
 #[path = "../examples/common/mod.rs"]
 mod common;
+mod support;
 
 use std::io::{self, Write};
 
 use common::{Client, Lisp, LispServer, messages};
 use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
+use lsp_lang::rpc_io::FrameError;
 use lsp_lang::{
-    Context, Document, Error, Handler, Json, Position, Reply, ResponseError, Server, Value, json,
+    Context, Document, Error, Features, Handler, Position, ResponseError, Server, Value, json,
 };
+use support::Live;
 
 const URI: &str = "file:///t.lisp";
+
+/// The custom methods the test handlers answer.
+const REQUESTS: &[&str] = &[
+    "test/echo",
+    "test/text",
+    "test/position",
+    "test/notify-scalar",
+    "custom/ask",
+    "custom/alive",
+    "custom/early",
+];
+const NOTIFICATIONS: &[&str] = &["custom/early", "custom/tell"];
+
+/// A server with all the custom methods registered.
+fn serve<G: Grammar + Clone, H: Handler<G>>(grammar: G, handler: H) -> Server<G, H> {
+    let mut server = Server::new(grammar, handler);
+    for method in REQUESTS {
+        server = server.custom_request(method);
+    }
+    for method in NOTIFICATIONS {
+        server = server.custom_notification(method);
+    }
+    server
+}
 
 /// Records what the server tells it, and answers as configured.
 #[derive(Default)]
@@ -23,8 +54,10 @@ struct Recorder {
     closed: Vec<String>,
     notifications: Vec<String>,
     responses: Vec<(u64, Result<String, i32>)>,
-    /// What `initialize` returns; `None` for an error.
-    capabilities: Option<Value>,
+    /// Refuse `initialize`.
+    fail_initialize: bool,
+    /// Capabilities to add.
+    extra: Vec<(String, Value<'static>)>,
     /// Requests to send on `initialized`.
     ask: usize,
 }
@@ -32,12 +65,25 @@ struct Recorder {
 impl Handler<Lisp> for Recorder {
     fn initialize(
         &mut self,
-        _: Json<'_>,
+        _: &Value<'_>,
         _: &mut Context<'_, Lisp>,
-    ) -> Result<Value, ResponseError> {
-        self.capabilities
-            .clone()
-            .ok_or_else(|| ResponseError::new(ResponseError::REQUEST_FAILED, "not today"))
+    ) -> Result<(), ResponseError> {
+        if self.fail_initialize {
+            Err(ResponseError::new(
+                ResponseError::REQUEST_FAILED,
+                "not today",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn features(&self) -> Features {
+        let mut features = Features::new();
+        for (name, value) in &self.extra {
+            features = features.capability(name.as_str(), value.clone());
+        }
+        features
     }
 
     fn changed(&mut self, doc: &Document<Lisp>, _: &mut Context<'_, Lisp>) {
@@ -50,12 +96,12 @@ impl Handler<Lisp> for Recorder {
         cx.clear_diagnostics(uri);
     }
 
-    fn notification(&mut self, method: &str, _: Json<'_>, cx: &mut Context<'_, Lisp>) {
+    fn notification(&mut self, method: &str, _: &Value<'_>, cx: &mut Context<'_, Lisp>) {
         self.notifications.push(method.to_owned());
         if method == "initialized" {
             for _ in 0..self.ask {
                 assert!(
-                    cx.request("workspace/configuration", &json!({ "items": [] }))
+                    cx.request("workspace/configuration", json!({ "items": [] }))
                         .is_ok()
                 );
             }
@@ -65,60 +111,46 @@ impl Handler<Lisp> for Recorder {
     fn response(
         &mut self,
         id: u64,
-        result: Result<Json<'_>, ResponseError>,
+        result: Result<Value<'_>, ResponseError>,
         _: &mut Context<'_, Lisp>,
     ) {
-        self.responses.push((
-            id,
-            result.map(|j| j.as_str().to_owned()).map_err(|e| e.code()),
-        ));
+        self.responses
+            .push((id, result.map(|v| v.to_string()).map_err(|e| e.code())));
     }
 
     fn request(
         &mut self,
         method: &str,
-        params: Json<'_>,
+        params: &Value<'_>,
         cx: &mut Context<'_, Lisp>,
-    ) -> Result<Reply, ResponseError> {
+    ) -> Result<Value<'static>, ResponseError> {
+        let not_open = || ResponseError::new(ResponseError::REQUEST_FAILED, "not open");
         match method {
-            "test/echo" => Ok(Reply::new(&params.parse::<Value>()?)?),
+            "test/echo" => Ok(params.clone().into_owned()),
             "test/text" => {
-                let uri: String = params.parse()?;
                 let doc = cx
-                    .document(&uri)
-                    .ok_or_else(|| ResponseError::new(ResponseError::REQUEST_FAILED, "not open"))?;
-                Ok(Reply::new(&(doc.version(), doc.text()))?)
+                    .document(params[0].as_str().unwrap_or(""))
+                    .ok_or_else(not_open)?;
+                Ok(json!([doc.version(), doc.text().to_owned()]))
             }
             "test/position" => {
-                let p: (String, u32) = params.parse()?;
                 let doc = cx
-                    .document(&p.0)
-                    .ok_or_else(|| ResponseError::new(ResponseError::REQUEST_FAILED, "not open"))?;
-                Ok(Reply::new(&doc.position(p.1))?)
+                    .document(params[0].as_str().unwrap_or(""))
+                    .ok_or_else(not_open)?;
+                let offset = params[1].as_u64().unwrap_or(0) as u32;
+                Ok(doc.position(offset).to_json())
             }
-            "test/unserializable" => {
-                let mut map = std::collections::BTreeMap::new();
-                let _previous = map.insert((1, 2), 3);
-                Ok(Reply::new(&map)?)
-            }
-            "test/notify-unserializable" => {
-                let mut map = std::collections::BTreeMap::new();
-                let _previous = map.insert((1, 2), 3);
-                match cx.notify("x", &map) {
-                    Err(Error::Json(_)) => Ok(Reply::null()),
-                    other => Err(ResponseError::new(-1, format!("{other:?}"))),
-                }
-            }
+            "test/notify-scalar" => match cx.notify("x", 5) {
+                Err(Error::InvalidParams(_)) => Ok(Value::Null),
+                other => Err(ResponseError::new(-1, format!("{other:?}"))),
+            },
             _ => Err(ResponseError::new(ResponseError::METHOD_NOT_FOUND, method)),
         }
     }
 }
 
 fn recorder() -> Recorder {
-    Recorder {
-        capabilities: Some(json!({})),
-        ..Recorder::default()
-    }
+    Recorder::default()
 }
 
 /// Runs one session; returns the server (for its handler), the outcome, and
@@ -126,25 +158,26 @@ fn recorder() -> Recorder {
 fn run<H: Handler<Lisp>>(
     handler: H,
     client: &Client,
-) -> (Server<Lisp, H>, Result<(), Error>, Vec<Value>) {
-    let mut server = Server::new(Lisp, handler);
+) -> (Server<Lisp, H>, Result<(), Error>, Vec<Value<'static>>) {
+    let mut server = serve(Lisp, handler);
     let mut output = Vec::new();
     let result = server.run(client.bytes(), &mut output);
     (server, result, messages(&output))
 }
 
-fn response(messages: &[Value], id: u64) -> &Value {
+fn response<'a>(messages: &'a [Value<'static>], id: u64) -> &'a Value<'static> {
+    static NULL: Value<'static> = Value::Null;
     messages
         .iter()
         .find(|m| m["id"] == id && m.get("method").is_none())
-        .unwrap_or(&Value::Null)
+        .unwrap_or(&NULL)
 }
 
-fn error_code(messages: &[Value], id: u64) -> Option<i64> {
+fn error_code(messages: &[Value<'static>], id: u64) -> Option<i64> {
     response(messages, id)["error"]["code"].as_i64()
 }
 
-fn logs(messages: &[Value]) -> Vec<(i64, String)> {
+fn logs(messages: &[Value<'static>]) -> Vec<(i64, String)> {
     messages
         .iter()
         .filter(|m| m["method"] == "window/logMessage")
@@ -157,7 +190,7 @@ fn logs(messages: &[Value]) -> Vec<(i64, String)> {
         .collect()
 }
 
-fn published(messages: &[Value]) -> Vec<&Value> {
+fn published<'a>(messages: &'a [Value<'static>]) -> Vec<&'a Value<'static>> {
     messages
         .iter()
         .filter(|m| m["method"] == "textDocument/publishDiagnostics")
@@ -210,10 +243,21 @@ fn test_run_input_ends_before_exit_returns_disconnected() {
 }
 
 #[test]
+fn test_run_answers_what_came_before_a_disconnect() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .request("test/echo", json!(["last words"]));
+    let (_, result, out) = run(recorder(), &client);
+    assert!(matches!(result, Err(Error::Disconnected)));
+    assert_eq!(response(&out, 2)["result"], json!(["last words"]));
+}
+
+#[test]
 fn test_request_before_initialize_returns_server_not_initialized() {
     let mut client = Client::new();
     client
-        .request("test/echo", json!(1))
+        .request("test/echo", json!([1]))
         .initialize(&[])
         .shutdown();
     let (_, result, out) = run(recorder(), &client);
@@ -243,7 +287,11 @@ fn test_initialize_twice_returns_invalid_request() {
     let mut client = Client::new();
     client.initialize(&[]).initialize(&[]).shutdown();
     let (_, _, out) = run(recorder(), &client);
-    assert!(response(&out, 1)["result"]["capabilities"].is_object());
+    assert!(
+        response(&out, 1)["result"]["capabilities"]
+            .as_object()
+            .is_some()
+    );
     assert_eq!(
         error_code(&out, 2),
         Some(i64::from(ResponseError::INVALID_REQUEST))
@@ -256,7 +304,8 @@ fn test_request_after_shutdown_returns_invalid_request() {
     client
         .initialize(&[])
         .request("shutdown", Value::Null)
-        .request("test/echo", json!(1))
+        .request("test/echo", json!([1]))
+        .request("shutdown", Value::Null)
         .open(URI, "(a)") // ignored after shutdown
         .notify("exit", Value::Null);
     let (server, result, out) = run(recorder(), &client);
@@ -265,7 +314,27 @@ fn test_request_after_shutdown_returns_invalid_request() {
         error_code(&out, 3),
         Some(i64::from(ResponseError::INVALID_REQUEST))
     );
+    assert_eq!(
+        error_code(&out, 4),
+        Some(i64::from(ResponseError::INVALID_REQUEST))
+    );
     assert!(server.handler().changes.is_empty());
+}
+
+#[test]
+fn test_unknown_method_after_shutdown_is_method_not_found() {
+    let mut client = Client::new();
+    client
+        .initialize(&[])
+        .request("shutdown", Value::Null)
+        .request("never/heard/of/it", json!({}))
+        .notify("exit", Value::Null);
+    let (_, result, out) = run(recorder(), &client);
+    assert!(result.is_ok());
+    assert_eq!(
+        error_code(&out, 3),
+        Some(i64::from(ResponseError::METHOD_NOT_FOUND))
+    );
 }
 
 #[test]
@@ -297,51 +366,70 @@ fn test_initialize_accepts_null_or_absent_params() {
 
 #[test]
 fn test_initialize_rejects_malformed_params() {
-    let mut client = Client::new();
-    client.request(
-        "initialize",
+    for params in [
         json!({ "capabilities": { "general": { "positionEncodings": 7 } } }),
-    );
+        json!({ "capabilities": 7 }),
+        json!([1]),
+    ] {
+        let mut client = Client::new();
+        client.request("initialize", params);
+        let (_, _, out) = run(recorder(), &client);
+        assert_eq!(
+            error_code(&out, 1),
+            Some(i64::from(ResponseError::INVALID_PARAMS))
+        );
+    }
+}
+
+#[test]
+fn test_initialize_sends_server_info_when_set() {
+    let mut client = Client::new();
+    client.initialize(&[]).shutdown();
+    let mut server = serve(Lisp, recorder()).with_info("lisp-ls", "9.9.9");
+    let mut output = Vec::new();
+    assert!(server.run(client.bytes(), &mut output).is_ok());
+    let out = messages(&output);
+    let info = &response(&out, 1)["result"]["serverInfo"];
+    assert_eq!(info["name"], "lisp-ls");
+    assert_eq!(info["version"], "9.9.9");
+    // Without it, there is none.
     let (_, _, out) = run(recorder(), &client);
-    assert_eq!(
-        error_code(&out, 1),
-        Some(i64::from(ResponseError::INVALID_PARAMS))
-    );
+    assert!(response(&out, 1)["result"].get("serverInfo").is_none());
 }
 
 #[test]
 fn test_initialize_merges_handler_capabilities_with_server_owned_ones() {
     let mut handler = recorder();
-    handler.capabilities = Some(json!({
-        "hoverProvider": true,
-        "positionEncoding": "utf-32",
-        "textDocumentSync": { "save": true, "change": 1 },
-    }));
+    handler.extra = vec![
+        ("renameProvider".to_owned(), json!(true)),
+        ("positionEncoding".to_owned(), json!("utf-32")),
+        (
+            "textDocumentSync".to_owned(),
+            json!({ "save": true, "change": 1 }),
+        ),
+    ];
     let mut client = Client::new();
     client.initialize(&[]).shutdown();
     let (_, _, out) = run(handler, &client);
     let caps = &response(&out, 1)["result"]["capabilities"];
-    assert_eq!(caps["hoverProvider"], true);
+    assert_eq!(caps["renameProvider"], true);
     assert_eq!(caps["positionEncoding"], "utf-16");
-    assert_eq!(
-        caps["textDocumentSync"],
-        json!({ "save": true, "change": 2, "openClose": true })
-    );
+    let sync = &caps["textDocumentSync"];
+    assert_eq!(sync["save"], true);
+    assert_eq!(sync["change"], 2);
+    assert_eq!(sync["openClose"], true);
 }
 
 #[test]
-fn test_initialize_non_object_capabilities_are_treated_as_empty() {
-    for weird in [json!(null), json!([1]), json!({ "textDocumentSync": 1 })] {
+fn test_initialize_non_object_sync_capability_is_ignored() {
+    for weird in [json!(null), json!([1]), json!(1)] {
         let mut handler = recorder();
-        handler.capabilities = Some(weird);
+        handler.extra = vec![("textDocumentSync".to_owned(), weird)];
         let mut client = Client::new();
         client.initialize(&[]).shutdown();
         let (_, _, out) = run(handler, &client);
-        let caps = &response(&out, 1)["result"]["capabilities"];
-        assert_eq!(
-            caps["textDocumentSync"],
-            json!({ "change": 2, "openClose": true })
-        );
+        let sync = &response(&out, 1)["result"]["capabilities"]["textDocumentSync"];
+        assert_eq!(sync, &json!({ "openClose": true, "change": 2 }));
     }
 }
 
@@ -350,10 +438,10 @@ fn test_initialize_handler_error_keeps_session_uninitialized() {
     let mut client = Client::new();
     client
         .initialize(&[])
-        .request("test/echo", json!(1))
+        .request("test/echo", json!([1]))
         .shutdown();
     let mut handler = recorder();
-    handler.capabilities = None;
+    handler.fail_initialize = true;
     let (_, result, out) = run(handler, &client);
     assert_eq!(
         error_code(&out, 1),
@@ -372,8 +460,39 @@ fn test_initialize_handler_error_keeps_session_uninitialized() {
 }
 
 #[test]
+fn test_initialize_can_be_retried_after_a_refusal() {
+    let mut client = Client::new();
+    client.initialize(&[]).initialize(&[]).shutdown();
+    struct FailsOnce(bool);
+    impl Handler<Lisp> for FailsOnce {
+        fn initialize(
+            &mut self,
+            _: &Value<'_>,
+            _: &mut Context<'_, Lisp>,
+        ) -> Result<(), ResponseError> {
+            if std::mem::replace(&mut self.0, true) {
+                Ok(())
+            } else {
+                Err(ResponseError::new(
+                    ResponseError::REQUEST_FAILED,
+                    "first time",
+                ))
+            }
+        }
+    }
+    let (_, result, out) = run(FailsOnce(false), &client);
+    assert!(result.is_ok());
+    assert!(error_code(&out, 1).is_some());
+    assert!(
+        response(&out, 2)["result"]["capabilities"]
+            .as_object()
+            .is_some()
+    );
+}
+
+#[test]
 fn test_each_run_is_a_fresh_session_with_the_same_handler() {
-    let mut server = Server::new(Lisp, recorder());
+    let mut server = serve(Lisp, recorder());
     let mut client = Client::new();
     client.initialize(&[]).open(URI, "(a)").shutdown();
     assert!(server.run(client.bytes(), Vec::new()).is_ok());
@@ -403,23 +522,29 @@ fn test_malformed_json_returns_parse_error_and_session_continues() {
     let mut client = Client::new();
     client.initialize(&[]);
     client.send_raw("{\"jsonrpc\": \"2.0\", \"id\": 9, \"method\": ");
-    client.request("test/echo", json!("still here")).shutdown();
+    client
+        .request("test/echo", json!(["still here"]))
+        .shutdown();
     let (_, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
     let parse_error = out
         .iter()
         .find(|m| m["error"]["code"] == ResponseError::PARSE_ERROR);
     assert_eq!(parse_error.map(|m| m["id"].clone()), Some(Value::Null));
-    assert_eq!(response(&out, 2)["result"], "still here");
+    assert_eq!(response(&out, 2)["result"], json!(["still here"]));
 }
 
 #[test]
-fn test_batch_and_shapeless_messages_return_invalid_request_with_null_id() {
+fn test_batches_and_shapeless_messages_are_answered_by_the_specification() {
     let mut client = Client::new();
     client.initialize(&[]);
+    // A batch of two things that are not messages: one error for each.
     client.send_raw("[1, 2]");
+    // An empty batch is one error, not an array.
+    client.send_raw("[]");
     client.send_raw(r#"{"jsonrpc":"2.0"}"#);
-    // An id without a method is an answer to the server; it is never answered.
+    // An id with no method, result, or error is not a message of any kind: it
+    // cannot be matched to an id, so it is refused under `null`.
     client.send_raw(r#"{"jsonrpc":"2.0","id":"x"}"#);
     client.shutdown();
     let (_, result, out) = run(recorder(), &client);
@@ -429,11 +554,31 @@ fn test_batch_and_shapeless_messages_return_invalid_request_with_null_id() {
         .filter(|m| m["error"]["code"] == ResponseError::INVALID_REQUEST)
         .map(|m| &m["id"])
         .collect();
-    assert_eq!(invalid, [&Value::Null, &Value::Null]);
+    assert_eq!(invalid, [&Value::Null; 5]);
     assert!(out.iter().all(|m| m["id"] != "x"));
-    let logs = logs(&out);
-    assert_eq!(logs.len(), 1);
-    assert!(logs[0].1.contains("\"x\""));
+}
+
+#[test]
+fn test_a_batch_of_requests_is_answered_with_one_array() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    client.send_raw(
+        r#"[{"jsonrpc":"2.0","id":10,"method":"test/echo","params":[1]},
+            {"jsonrpc":"2.0","method":"custom/tell"},
+            {"jsonrpc":"2.0","id":11,"method":"test/echo","params":[2]}]"#,
+    );
+    client.shutdown();
+    let mut server = serve(Lisp, recorder());
+    let mut output = Vec::new();
+    assert!(server.run(client.bytes(), &mut output).is_ok());
+    let text = String::from_utf8_lossy(&output);
+    assert!(text.contains(
+        r#"[{"jsonrpc":"2.0","id":10,"result":[1]},{"jsonrpc":"2.0","id":11,"result":[2]}]"#
+    ));
+    assert_eq!(
+        server.handler().notifications,
+        ["initialized", "custom/tell"]
+    );
 }
 
 #[test]
@@ -442,12 +587,12 @@ fn test_request_with_invalid_id_is_refused_not_dispatched() {
     client.initialize(&[]);
     for id in ["null", "1.5", "{\"a\":1}", "true", "[1]"] {
         client.send_raw(&format!(
-            r#"{{"jsonrpc":"2.0","id":{id},"method":"test/echo","params":"leaked"}}"#
+            r#"{{"jsonrpc":"2.0","id":{id},"method":"test/echo","params":["leaked"]}}"#
         ));
     }
     // A `shutdown` with a null id must not shut the session down.
     client.send_raw(r#"{"jsonrpc":"2.0","id":null,"method":"shutdown"}"#);
-    client.request("test/echo", json!("still running"));
+    client.request("test/echo", json!(["still running"]));
     client.shutdown();
     let (server, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
@@ -458,9 +603,25 @@ fn test_request_with_invalid_id_is_refused_not_dispatched() {
         .collect();
     assert_eq!(refused.len(), 6);
     assert!(refused.iter().all(|id| id.is_null()));
-    assert!(out.iter().all(|m| m["result"] != "leaked"));
-    assert_eq!(response(&out, 2)["result"], "still running");
+    assert!(out.iter().all(|m| m["result"] != json!(["leaked"])));
+    assert_eq!(response(&out, 2)["result"], json!(["still running"]));
     assert_eq!(server.handler().notifications, ["initialized"]);
+}
+
+#[test]
+fn test_params_of_the_wrong_kind_are_an_invalid_request() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    // JSON-RPC params are structured: an array or an object.
+    client.send_raw(r#"{"jsonrpc":"2.0","id":5,"method":"test/echo","params":5}"#);
+    client.send_raw(r#"{"jsonrpc":"2.0","id":6,"method":"test/echo","params":null}"#);
+    client.shutdown();
+    let (_, _, out) = run(recorder(), &client);
+    assert_eq!(
+        error_code(&out, 5),
+        Some(i64::from(ResponseError::INVALID_REQUEST))
+    );
+    assert_eq!(response(&out, 6)["result"], Value::Null);
 }
 
 #[test]
@@ -510,25 +671,11 @@ fn test_invalid_params_returns_invalid_params() {
 }
 
 #[test]
-fn test_unserializable_reply_returns_internal_error() {
+fn test_notify_with_scalar_params_is_refused_and_sends_nothing() {
     let mut client = Client::new();
     client
         .initialize(&[])
-        .request("test/unserializable", Value::Null)
-        .shutdown();
-    let (_, _, out) = run(recorder(), &client);
-    assert_eq!(
-        error_code(&out, 2),
-        Some(i64::from(ResponseError::INTERNAL_ERROR))
-    );
-}
-
-#[test]
-fn test_unserializable_notification_sends_nothing() {
-    let mut client = Client::new();
-    client
-        .initialize(&[])
-        .request("test/notify-unserializable", Value::Null)
+        .request("test/notify-scalar", Value::Null)
         .shutdown();
     let (_, _, out) = run(recorder(), &client);
     assert!(response(&out, 2)["result"].is_null());
@@ -543,7 +690,15 @@ fn test_error_message_is_escaped_json() {
         .request("weird \"name\"\n", Value::Null)
         .shutdown();
     let (_, _, out) = run(recorder(), &client);
-    assert_eq!(response(&out, 2)["error"]["message"], "weird \"name\"\n");
+    assert_eq!(
+        error_code(&out, 2),
+        Some(i64::from(ResponseError::METHOD_NOT_FOUND))
+    );
+    assert!(
+        response(&out, 2)["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("weird \"name\"\n"))
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -552,26 +707,59 @@ fn test_error_message_is_escaped_json() {
 
 #[test]
 fn test_invalid_header_ends_the_session() {
-    let mut server = Server::new(Lisp, recorder());
+    let mut server = serve(Lisp, recorder());
     let input = b"Content-Length: twelve\r\n\r\n{}";
     assert!(matches!(
         server.run(&input[..], Vec::new()),
-        Err(Error::InvalidHeader { .. })
+        Err(Error::Frame(FrameError::InvalidContentLength))
     ));
     let input = b"Content-Type: x\r\n\r\n{}";
     assert!(matches!(
         server.run(&input[..], Vec::new()),
-        Err(Error::InvalidHeader { .. })
+        Err(Error::Frame(FrameError::MissingContentLength))
     ));
 }
 
 #[test]
-fn test_message_over_limit_returns_too_large_and_reads_no_body() {
+fn test_header_names_are_case_insensitive_and_extra_headers_are_ignored() {
+    let body = r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+    let input = format!(
+        "content-type: application/vscode-jsonrpc; charset=utf-8\r\nCONTENT-LENGTH:  {} \r\n\r\n{body}",
+        body.len()
+    );
+    let mut server = serve(Lisp, recorder());
+    let mut output = Vec::new();
+    let _ended = server.run(input.as_bytes(), &mut output);
+    let out = messages(&output);
+    assert!(
+        response(&out, 1)["result"]["capabilities"]
+            .as_object()
+            .is_some()
+    );
+}
+
+#[test]
+fn test_message_over_limit_is_refused_and_the_session_goes_on() {
     let mut client = Client::new();
     client.initialize(&[]);
-    let mut server = Server::new(Lisp, recorder()).with_message_limit(32);
-    let result = server.run(client.bytes(), Vec::new());
-    assert!(matches!(result, Err(Error::TooLarge { limit: 32, .. })));
+    // A 32-byte limit refuses `initialize`, then `initialized`, then reads the
+    // end of the input.
+    let mut server = serve(Lisp, recorder()).with_message_limit(32);
+    let mut output = Vec::new();
+    let result = server.run(client.bytes(), &mut output);
+    assert!(matches!(result, Err(Error::Disconnected)));
+    let out = messages(&output);
+    let refused: Vec<&Value> = out
+        .iter()
+        .filter(|m| m["error"]["code"] == ResponseError::INVALID_REQUEST)
+        .map(|m| &m["id"])
+        .collect();
+    assert_eq!(refused, [&Value::Null, &Value::Null]);
+    assert!(
+        out[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("too large"))
+    );
 }
 
 #[test]
@@ -587,7 +775,7 @@ fn test_failing_output_returns_io_error() {
     }
     let mut client = Client::new();
     client.initialize(&[]).shutdown();
-    let mut server = Server::new(Lisp, recorder());
+    let mut server = serve(Lisp, recorder());
     assert!(matches!(
         server.run(client.bytes(), Broken),
         Err(Error::Io(_))
@@ -614,10 +802,39 @@ fn test_turns_without_output_write_nothing() {
     }
     client.shutdown();
     let mut sink = Counting(0);
-    let mut server = Server::new(Lisp, recorder());
+    let mut server = serve(Lisp, recorder());
     assert!(server.run(client.bytes(), &mut sink).is_ok());
     // initialize and shutdown responses only; the recorder publishes nothing.
     assert_eq!(sink.0, 2);
+}
+
+#[test]
+fn test_one_write_carries_everything_a_handler_sent() {
+    struct Chatty;
+    impl Handler<Lisp> for Chatty {
+        fn changed(&mut self, doc: &Document<Lisp>, cx: &mut Context<'_, Lisp>) {
+            for i in 0..5 {
+                cx.log(lsp_lang::MessageType::Info, &format!("note {i}"));
+            }
+            cx.clear_diagnostics(doc.uri());
+        }
+    }
+    struct Counting(Vec<usize>);
+    impl Write for Counting {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.push(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut client = Client::new();
+    client.initialize(&[]).open(URI, "(a)").shutdown();
+    let mut sink = Counting(Vec::new());
+    assert!(serve(Lisp, Chatty).run(client.bytes(), &mut sink).is_ok());
+    // initialize, the six messages of `changed`, shutdown.
+    assert_eq!(sink.0.len(), 3);
 }
 
 // ---------------------------------------------------------------------------
@@ -677,7 +894,7 @@ fn test_did_change_without_range_replaces_the_text() {
 fn test_did_change_several_edits_apply_in_order_with_one_call() {
     let mut client = Client::new();
     client.initialize(&[]).open(URI, "abc");
-    let edit = |line: u32, from: u32, to: u32, text: &str| json!({ "range": { "start": { "line": line, "character": from }, "end": { "line": line, "character": to } }, "text": text });
+    let edit = |line: u32, from: u32, to: u32, text: &str| json!({ "range": { "start": { "line": line, "character": from }, "end": { "line": line, "character": to } }, "text": text.to_owned() });
     client.notify(
         "textDocument/didChange",
         json!({
@@ -702,7 +919,7 @@ fn test_did_change_out_of_range_columns_clamp_but_missing_lines_go_out_of_step()
         .edit(URI, 3, (2, 0), (2, 9), "?") // the line just past the last: the end
         .edit(URI, 4, (50, 0), (60, 0), "X") // lines this copy does not have
         .edit(URI, 5, (0, 0), (0, 0), "Y") // ignored while out of step
-        .request("test/text", json!(URI))
+        .request("test/text", json!([URI]))
         .shutdown();
     let (server, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
@@ -736,11 +953,11 @@ fn test_out_of_step_document_resyncs_on_a_whole_text_change() {
     let ranged = json!({ "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } }, "text": ";" });
     client.notify(
         "textDocument/didChange",
-        json!({ "textDocument": { "uri": URI, "version": 4 }, "contentChanges": [ranged, { "text": "(b)" }, ranged] }),
+        json!({ "textDocument": { "uri": URI, "version": 4 }, "contentChanges": [ranged.clone(), { "text": "(b)" }, ranged] }),
     );
     client
         .edit(URI, 5, (0, 4), (0, 4), "!")
-        .request("test/text", json!(URI))
+        .request("test/text", json!([URI]))
         .shutdown();
     let (server, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
@@ -763,7 +980,7 @@ fn test_did_change_with_a_stale_version_goes_out_of_step() {
         .edit(URI, 2, (0, 1), (0, 2), "b")
         .edit(URI, 2, (0, 1), (0, 2), "c") // a repeat of version 2
         .edit(URI, 3, (0, 1), (0, 2), "d") // ignored: out of step
-        .request("test/text", json!(URI))
+        .request("test/text", json!([URI]))
         .shutdown();
     let (server, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
@@ -779,7 +996,7 @@ fn test_did_change_with_a_stale_version_goes_out_of_step() {
 fn test_did_change_failing_partway_restores_the_starting_text() {
     let mut client = Client::new();
     client.initialize(&[]).open(URI, "abc");
-    let edit = |line: u32, character: u32, text: &str| json!({ "range": { "start": { "line": line, "character": character }, "end": { "line": line, "character": character } }, "text": text });
+    let edit = |line: u32, character: u32, text: &str| json!({ "range": { "start": { "line": line, "character": character }, "end": { "line": line, "character": character } }, "text": text.to_owned() });
     client.notify(
         "textDocument/didChange",
         json!({
@@ -787,7 +1004,7 @@ fn test_did_change_failing_partway_restores_the_starting_text() {
             "contentChanges": [edit(0, 0, "1"), edit(0, 0, "2"), edit(7, 0, "lost")],
         }),
     );
-    client.request("test/text", json!(URI)).shutdown();
+    client.request("test/text", json!([URI])).shutdown();
     let (server, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
     assert_eq!(server.handler().changes.len(), 1);
@@ -854,7 +1071,7 @@ fn test_did_close_removes_the_document_and_clears_diagnostics() {
     let published = published(&out);
     assert_eq!(published.len(), 2);
     assert_eq!(
-        published[0]["diagnostics"].as_array().map(Vec::len),
+        published[0]["diagnostics"].as_array().map(|d| d.len()),
         Some(1)
     );
     assert_eq!(published[1], &json!({ "uri": URI, "diagnostics": [] }));
@@ -896,8 +1113,8 @@ fn test_documents_are_independent() {
         server.handler().changes[2],
         (other.to_owned(), 2, "(c)".to_owned())
     );
-    assert_eq!(response(&out, 2)["result"], json!(Position::new(0, 2)));
-    assert_eq!(response(&out, 3)["result"], json!(Position::new(0, 3)));
+    assert_eq!(response(&out, 2)["result"], Position::new(0, 2).to_json());
+    assert_eq!(response(&out, 3)["result"], Position::new(0, 3).to_json());
 }
 
 /// A grammar whose lexer breaks the contract on `!`: it leaves the character
@@ -962,7 +1179,7 @@ fn test_unparsable_edit_keeps_the_last_good_state_until_resynced() {
         json!({ "textDocument": { "uri": URI, "version": 4 }, "contentChanges": [{ "text": "fine" }] }),
     );
     client.shutdown();
-    let mut server = Server::new(Gappy, GappyRecorder::default());
+    let mut server = serve(Gappy, GappyRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
     // Never dropped: no `closed`, and the whole-text change brought it back.
@@ -989,7 +1206,7 @@ fn test_failed_reopen_keeps_the_open_version_out_of_step() {
         .edit(URI, 2, (0, 0), (0, 0), "x") // ignored: out of step
         .open(URI, "ok again")
         .shutdown();
-    let mut server = Server::new(Gappy, GappyRecorder::default());
+    let mut server = serve(Gappy, GappyRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
     assert!(server.handler().closed.is_empty());
@@ -1004,7 +1221,7 @@ fn test_failed_reopen_keeps_the_open_version_out_of_step() {
     assert!(logs[1].1.contains("out of step"));
 }
 
-/// A grammar whose lexer panics on `#` — a bug in a language's grammar.
+/// A grammar whose lexer panics on `#`, a bug in a language's grammar.
 #[derive(Clone, Copy)]
 struct Panicky;
 
@@ -1046,7 +1263,7 @@ fn test_grammar_panic_costs_neither_the_document_nor_the_session() {
         .edit(URI, 2, (0, 1), (0, 1), "#") // panics while reparsing, whole or not
         .open(other, "a # b") // panics while opening
         .edit(other, 2, (0, 0), (0, 0), "x") // ignored: it never opened
-        .request("test/echo", json!(1));
+        .request("test/echo", json!([1]));
     // Whole-text changes recover both.
     for (uri, text) in [(URI, "abcd"), (other, "fine")] {
         client.notify(
@@ -1060,7 +1277,7 @@ fn test_grammar_panic_costs_neither_the_document_nor_the_session() {
             json!({ "textDocument": { "uri": other } }),
         )
         .shutdown();
-    let mut server = Server::new(Panicky, PanickyRecorder::default());
+    let mut server = serve(Panicky, PanickyRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
     let changed: Vec<(&str, i32, &str)> = server
@@ -1134,7 +1351,7 @@ fn test_failed_incremental_reparse_falls_back_to_a_full_parse() {
         .edit(URI, 2, (1, 1), (1, 2), "c") // inside a list: a fragment reparse
         .edit(URI, 3, (0, 1), (0, 1), "x")
         .shutdown();
-    let mut server = Server::new(FragileLisp, FragileRecorder::default());
+    let mut server = serve(FragileLisp, FragileRecorder::default());
     let mut output = Vec::new();
     assert!(server.run(client.bytes(), &mut output).is_ok());
     assert_eq!(
@@ -1188,7 +1405,7 @@ fn test_lisp_server_publishes_versioned_diagnostics() {
     assert_eq!(duplicate, Some(json!({ "line": 0, "character": 8 })));
     assert_eq!(published[1]["version"], 2);
     assert_eq!(
-        published[1]["diagnostics"].as_array().map(Vec::len),
+        published[1]["diagnostics"].as_array().map(|d| d.len()),
         Some(2)
     );
 }
@@ -1214,7 +1431,7 @@ fn test_lisp_server_hover_and_definition() {
     );
     assert_eq!(
         response(&out, 3)["result"],
-        json!({ "uri": URI, "range": { "start": { "line": 1, "character": 8 }, "end": { "line": 1, "character": 12 } } })
+        json!([{ "uri": URI, "range": { "start": { "line": 1, "character": 8 }, "end": { "line": 1, "character": 12 } } }])
     );
     assert_eq!(
         response(&out, 4)["result"]["contents"]["value"],
@@ -1225,87 +1442,101 @@ fn test_lisp_server_hover_and_definition() {
 }
 
 // ---------------------------------------------------------------------------
-// Server-to-client requests
+// Server-to-client requests (a conversation, so over pipes)
 // ---------------------------------------------------------------------------
+
+fn answer(live: &mut Live<Recorder>, id: u64, result: Value<'_>) {
+    live.send(&json!({ "jsonrpc": "2.0", "id": id, "result": result }));
+}
+
+/// Waits until everything sent so far has been handled: a request's answer
+/// comes after any outcome delivered while handling the messages before it.
+fn sync(live: &mut Live<Recorder>) {
+    let id = live.request("test/echo", json!(["sync"]));
+    assert_eq!(live.recv_response(id)["result"], json!(["sync"]));
+}
 
 #[test]
 fn test_context_request_numbers_ids_and_routes_responses() {
     let mut handler = recorder();
     handler.ask = 2;
-    let mut client = Client::new();
-    client.initialize(&[]);
-    client.send(&json!({ "jsonrpc": "2.0", "id": 1, "result": [{ "a": 1 }] }));
-    client
-        .send(&json!({ "jsonrpc": "2.0", "id": 0, "error": { "code": -32603, "message": "no" } }));
-    // A second answer to id 0, ids the server never sent, and an answer with
-    // no id are all logged and dropped.
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0 , "result": null }));
-    client.send(&json!({ "jsonrpc": "2.0", "id": "zero", "result": 0 }));
-    client.send(&json!({ "jsonrpc": "2.0", "id": 7, "result": 0 }));
-    client.send(&json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": "parse" } }));
-    client.shutdown();
-    let (server, result, out) = run(handler, &client);
-    assert!(result.is_ok());
+    let mut live = Live::start(serve(Lisp, handler));
+    live.initialize(&[]);
+    let first = live.recv_method("workspace/configuration");
+    let second = live.recv_method("workspace/configuration");
+    assert_eq!((&first["id"], &second["id"]), (&json!(1), &json!(2)));
 
-    let sent: Vec<&Value> = out
-        .iter()
-        .filter(|m| m["method"] == "workspace/configuration")
-        .map(|m| &m["id"])
-        .collect();
-    assert_eq!(sent, [&json!(0), &json!(1)]);
+    answer(&mut live, 2, json!([{ "a": 1 }]));
+    live.send(&json!({ "jsonrpc": "2.0", "id": 1, "error": { "code": -32603, "message": "no" } }));
+    // A second answer to id 1, ids the server never sent, and an answer with
+    // no id are all logged and dropped.
+    answer(&mut live, 1, Value::Null);
+    live.send(&json!({ "jsonrpc": "2.0", "id": "zero", "result": 0 }));
+    answer(&mut live, 7, json!(0));
+    live.send(&json!({ "jsonrpc": "2.0", "error": { "code": -32700, "message": "parse" } }));
+    sync(&mut live);
+    live.shutdown();
+    let (result, server, rest) = live.finish();
+    assert!(result.is_ok());
     assert_eq!(
         server.handler().responses,
-        [(1, Ok(r#"[{"a":1}]"#.to_owned())), (0, Err(-32603))]
+        [(2, Ok(r#"[{"a":1}]"#.to_owned())), (1, Err(-32603))]
     );
-    let warnings = logs(&out);
+    let warnings = logs(&rest);
     assert_eq!(warnings.len(), 4);
     assert!(warnings.iter().all(|(kind, _)| *kind == 2));
     // Nothing that looks like a response is ever answered.
-    assert!(out.iter().all(|m| m.get("error").is_none()));
+    assert!(rest.iter().all(|m| m.get("error").is_none()));
 }
 
 #[test]
 fn test_client_answers_are_read_leniently() {
     let mut handler = recorder();
     handler.ask = 4;
-    let mut client = Client::new();
-    client.initialize(&[]);
-    client.send_raw(r#"{"jsonrpc":"2.0","id":0,"result":null}"#);
-    client.send_raw(r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601}}"#);
-    client.send_raw(r#"{"jsonrpc":"2.0","id":2,"error":{"code":1e3,"message":"odd"}}"#);
-    client.send_raw(r#"{"jsonrpc":"2.0","id":3,"error":null}"#);
-    client.shutdown();
-    let (server, result, out) = run(handler, &client);
+    let mut live = Live::start(serve(Lisp, handler));
+    live.initialize(&[]);
+    for _ in 0..4 {
+        let _request = live.recv_method("workspace/configuration");
+    }
+    live.send_raw(r#"{"jsonrpc":"2.0","id":1,"result":null}"#);
+    live.send_raw(r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601}}"#);
+    live.send_raw(r#"{"jsonrpc":"2.0","id":3,"error":{"code":1e3,"message":"odd"}}"#);
+    live.send_raw(r#"{"jsonrpc":"2.0","id":4,"error":null}"#);
+    sync(&mut live);
+    live.shutdown();
+    let (result, server, rest) = live.finish();
     assert!(result.is_ok());
-    assert_eq!(
-        server.handler().responses,
-        [
-            (0, Ok("null".to_owned())),
-            (1, Err(ResponseError::METHOD_NOT_FOUND)),
-            (2, Err(ResponseError::INTERNAL_ERROR)),
-            (3, Err(ResponseError::INTERNAL_ERROR)),
-        ]
-    );
-    assert!(out.iter().all(|m| m.get("error").is_none()));
+    let responses = &server.handler().responses;
+    assert_eq!(responses[0], (1, Ok("null".to_owned())));
+    // An answer that is not a valid response (an error without a message, a
+    // non-integer code, a null error) ends the request it names with an error
+    // saying so, and is never answered.
+    assert_eq!(responses.len(), 4);
+    for broken in &responses[1..] {
+        assert_eq!(broken.1, Err(ResponseError::INVALID_REQUEST));
+    }
+    assert_eq!(logs(&rest).len(), 3);
+    assert!(rest.iter().all(|m| m.get("error").is_none()));
 }
 
 #[test]
 fn test_answer_before_any_request_is_dropped() {
     let mut handler = recorder();
     handler.ask = 1;
-    let mut client = Client::new();
+    let mut live = Live::start(serve(Lisp, handler));
     // Before `initialize`, the server has asked nothing; this is not an answer.
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": "early" }));
-    client.initialize(&[]);
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": "on time" }));
-    client.shutdown();
-    let (server, result, out) = run(handler, &client);
+    answer(&mut live, 1, json!("early"));
+    live.initialize(&[]);
+    let _asked = live.recv_method("workspace/configuration");
+    answer(&mut live, 1, json!("on time"));
+    sync(&mut live);
+    live.shutdown();
+    let (result, server, _) = live.finish();
     assert!(result.is_ok());
     assert_eq!(
         server.handler().responses,
-        [(0, Ok("\"on time\"".to_owned()))]
+        [(1, Ok("\"on time\"".to_owned()))]
     );
-    assert_eq!(logs(&out).len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -1339,13 +1570,13 @@ impl Bomb {
 impl Handler<Lisp> for Bomb {
     fn initialize(
         &mut self,
-        _: Json<'_>,
+        _: &Value<'_>,
         cx: &mut Context<'_, Lisp>,
-    ) -> Result<Value, ResponseError> {
+    ) -> Result<(), ResponseError> {
         let starting = json!({ "type": 3, "message": "starting" });
-        assert!(cx.notify("window/logMessage", &starting).is_ok());
+        assert!(cx.notify("window/logMessage", starting).is_ok());
         self.enter("initialize", "");
-        Ok(json!({ "hoverProvider": true }))
+        Ok(())
     }
 
     fn changed(&mut self, doc: &Document<Lisp>, _: &mut Context<'_, Lisp>) {
@@ -1360,17 +1591,17 @@ impl Handler<Lisp> for Bomb {
     fn request(
         &mut self,
         method: &str,
-        _: Json<'_>,
+        _: &Value<'_>,
         _: &mut Context<'_, Lisp>,
-    ) -> Result<Reply, ResponseError> {
+    ) -> Result<Value<'static>, ResponseError> {
         self.enter("request", method);
-        Ok(Reply::null())
+        Ok(Value::Null)
     }
 
-    fn notification(&mut self, method: &str, _: Json<'_>, cx: &mut Context<'_, Lisp>) {
+    fn notification(&mut self, method: &str, _: &Value<'_>, cx: &mut Context<'_, Lisp>) {
         if method == "initialized" {
             for _ in 0..self.ask {
-                assert!(cx.request("workspace/configuration", &json!({})).is_ok());
+                assert!(cx.request("workspace/configuration", json!({})).is_ok());
             }
         }
         self.enter("notification", method);
@@ -1379,11 +1610,11 @@ impl Handler<Lisp> for Bomb {
     fn response(
         &mut self,
         id: u64,
-        result: Result<Json<'_>, ResponseError>,
+        result: Result<Value<'_>, ResponseError>,
         _: &mut Context<'_, Lisp>,
     ) {
         let detail = match result {
-            Ok(json) => format!("{id} ok {}", json.as_str()),
+            Ok(value) => format!("{id} ok {value}"),
             Err(e) => format!("{id} err {}", e.code()),
         };
         self.enter("response", &detail);
@@ -1391,66 +1622,70 @@ impl Handler<Lisp> for Bomb {
 }
 
 /// A session that reaches every entry point once after `initialize` (with one
-/// server request answered as id 0), then proves the session is alive with a
-/// final request, id 3.
-fn every_entry_point(client: &mut Client) {
-    client
-        .initialize(&[])
-        .open(URI, "(a)")
-        .edit(URI, 2, (0, 1), (0, 2), "b")
-        .request("custom/ask", json!({}))
-        .notify("custom/tell", json!({}));
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": "answer" }));
-    client
-        .notify(
-            "textDocument/didClose",
-            json!({ "textDocument": { "uri": URI } }),
-        )
-        .request("custom/alive", json!({}))
-        .shutdown();
+/// server request, id 1, answered), then proves the session is alive with a
+/// final request. Returns the answers to `custom/ask` (id 2) and
+/// `custom/alive` (id 3).
+fn every_entry_point(live: &mut Live<Bomb>) -> (Value<'static>, Value<'static>) {
+    live.initialize(&[]);
+    let asked = live.recv_method("workspace/configuration");
+    live.open(URI, "(a)");
+    live.notify(
+        "textDocument/didChange",
+        json!({ "textDocument": { "uri": URI, "version": 2 }, "contentChanges": [{
+            "range": { "start": { "line": 0, "character": 1 }, "end": { "line": 0, "character": 2 } },
+            "text": "b" }] }),
+    );
+    let ask = live.request("custom/ask", json!({}));
+    live.notify("custom/tell", json!({}));
+    live.send(&json!({ "jsonrpc": "2.0", "id": asked["id"].clone(), "result": "answer" }));
+    live.notify(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": URI } }),
+    );
+    let alive = live.request("custom/alive", json!({}));
+    let first = live.recv_response(ask);
+    let last = live.recv_response(alive);
+    live.shutdown();
+    (first, last)
 }
 
 #[test]
 fn test_handler_panic_in_request_answers_internal_error_and_session_lives() {
-    let mut client = Client::new();
-    every_entry_point(&mut client);
     let mut bomb = Bomb::armed(&["request"]);
     bomb.ask = 1;
-    let (server, result, out) = run(bomb, &client);
+    let mut live = Live::start(serve(Lisp, bomb));
+    let (first, last) = every_entry_point(&mut live);
+    let (result, server, _) = live.finish();
     assert!(result.is_ok());
-    for id in [2, 3] {
-        assert_eq!(
-            error_code(&out, id),
-            Some(i64::from(ResponseError::INTERNAL_ERROR))
-        );
-        let message = response(&out, id)["error"]["message"]
-            .as_str()
-            .unwrap_or("");
+    for answer in [&first, &last] {
+        assert_eq!(answer["error"]["code"], ResponseError::INTERNAL_ERROR);
+        let message = answer["error"]["message"].as_str().unwrap_or("");
         assert!(message.contains("panicked") && message.contains("handler bug in request"));
     }
     // Every other entry point still ran.
     let calls = &server.handler().calls;
     assert!(calls.iter().any(|c| c == "changed (b)"));
     assert!(calls.iter().any(|c| c == "closed file:///t.lisp"));
-    assert!(calls.iter().any(|c| c == "response 0 ok \"answer\""));
+    assert!(calls.iter().any(|c| c == "response 1 ok \"answer\""));
 }
 
 #[test]
 fn test_handler_panic_in_each_notification_entry_point_is_logged() {
     for entry in ["changed", "closed", "notification", "response"] {
-        let mut client = Client::new();
-        every_entry_point(&mut client);
         let mut bomb = Bomb::armed(&[entry]);
         bomb.ask = 1;
-        let (server, result, out) = run(bomb, &client);
+        let mut live = Live::start(serve(Lisp, bomb));
+        let (first, last) = every_entry_point(&mut live);
+        let (result, server, rest) = live.finish();
         assert!(result.is_ok(), "{entry}: the session ended");
         // The session is alive to the end: the last request is answered.
-        let last = response(&out, 3);
-        assert!(
-            last.get("result").is_some() && last.get("error").is_none(),
-            "{entry}: the final request was not answered"
-        );
-        let errors: Vec<String> = logs(&out)
+        for answer in [&first, &last] {
+            assert!(
+                answer.get("result").is_some() && answer.get("error").is_none(),
+                "{entry}: a request was not answered"
+            );
+        }
+        let errors: Vec<String> = logs(&rest)
             .into_iter()
             .filter(|(kind, _)| *kind == 1)
             .map(|(_, text)| text)
@@ -1483,17 +1718,20 @@ fn test_handler_panic_in_changed_keeps_the_document() {
     // before it must not have dropped it.
     struct PanicsOnChange(LispServer);
     impl Handler<Lisp> for PanicsOnChange {
+        fn features(&self) -> Features {
+            self.0.features()
+        }
         fn changed(&mut self, doc: &Document<Lisp>, cx: &mut Context<'_, Lisp>) {
             self.0.changed(doc, cx);
             assert!(doc.version() < 2, "handler bug in changed");
         }
-        fn request(
+        fn hover(
             &mut self,
-            method: &str,
-            params: Json<'_>,
+            doc: &Document<Lisp>,
+            at: Position,
             cx: &mut Context<'_, Lisp>,
-        ) -> Result<Reply, ResponseError> {
-            self.0.request(method, params, cx)
+        ) -> Result<Option<lsp_lang::Hover>, ResponseError> {
+            self.0.hover(doc, at, cx)
         }
     }
     let (_, result, out) = run(PanicsOnChange(LispServer::default()), &client);
@@ -1530,69 +1768,97 @@ fn test_handler_panic_in_initialize_refuses_it_and_discards_what_it_sent() {
     assert!(matches!(result, Err(Error::ExitWithoutShutdown)));
 }
 
+#[test]
+fn test_handler_panic_in_features_refuses_initialize() {
+    struct BadFeatures;
+    impl Handler<Lisp> for BadFeatures {
+        #[allow(clippy::panic)]
+        fn features(&self) -> Features {
+            panic!("handler bug in features")
+        }
+    }
+    let mut client = Client::new();
+    client.initialize(&[]).shutdown();
+    let (_, _, out) = run(BadFeatures, &client);
+    assert!(
+        response(&out, 1)["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("handler bug in features"))
+    );
+}
+
 /// Sends a notification and a request from `initialize`.
 struct EagerInit {
     fail: bool,
-    responses: Vec<u64>,
+    responses: Vec<(u64, i32)>,
 }
 
 impl Handler<Lisp> for EagerInit {
     fn initialize(
         &mut self,
-        _: Json<'_>,
+        _: &Value<'_>,
         cx: &mut Context<'_, Lisp>,
-    ) -> Result<Value, ResponseError> {
+    ) -> Result<(), ResponseError> {
         let message = json!({ "type": 3, "message": "hi" });
-        assert!(cx.notify("window/showMessage", &message).is_ok());
-        assert!(cx.request("window/showMessageRequest", &message).is_ok());
+        assert!(cx.notify("window/showMessage", message.clone()).is_ok());
+        assert!(cx.request("window/showMessageRequest", message).is_ok());
         if self.fail {
             return Err(ResponseError::new(ResponseError::REQUEST_FAILED, "no"));
         }
-        Ok(json!({}))
+        Ok(())
     }
 
-    fn response(&mut self, id: u64, _: Result<Json<'_>, ResponseError>, _: &mut Context<'_, Lisp>) {
-        self.responses.push(id);
+    fn response(
+        &mut self,
+        id: u64,
+        result: Result<Value<'_>, ResponseError>,
+        _: &mut Context<'_, Lisp>,
+    ) {
+        self.responses
+            .push((id, result.err().map_or(0, |e| e.code())));
     }
 }
 
 #[test]
 fn test_initialize_result_goes_out_before_anything_the_handler_sent() {
-    let mut client = Client::new();
-    client.initialize(&[]);
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": null }));
-    client.shutdown();
     let handler = EagerInit {
         fail: false,
         responses: Vec::new(),
     };
-    let (server, result, out) = run(handler, &client);
-    assert!(result.is_ok());
-    let order: Vec<String> = out
-        .iter()
-        .map(|m| match m["method"].as_str() {
+    let mut live = Live::start(serve(Lisp, handler));
+    let id = live.request("initialize", json!({}));
+    let mut order = Vec::new();
+    let mut asked = Value::Null;
+    while order.len() < 3 {
+        let Some(message) = live.recv() else { break };
+        order.push(match message["method"].as_str() {
             Some(method) => method.to_owned(),
-            None => format!("response {}", m["id"]),
-        })
-        .collect();
+            None => format!("response {}", message["id"]),
+        });
+        if message["method"] == "window/showMessageRequest" {
+            asked = message;
+        }
+    }
     assert_eq!(
-        order[..3],
+        order,
         [
-            "response 1",
-            "window/showMessage",
-            "window/showMessageRequest"
+            format!("response {id}"),
+            "window/showMessage".to_owned(),
+            "window/showMessageRequest".to_owned()
         ]
     );
     // The request sent during `initialize` is outstanding and gets its answer.
-    assert_eq!(server.handler().responses, [0]);
+    live.send(&json!({ "jsonrpc": "2.0", "id": asked["id"].clone(), "result": null }));
+    live.shutdown();
+    let (result, server, _) = live.finish();
+    assert!(result.is_ok());
+    assert_eq!(server.handler().responses, [(1, 0)]);
 }
 
 #[test]
-fn test_failed_initialize_sends_nothing_from_the_handler_and_forgets_its_requests() {
+fn test_failed_initialize_sends_nothing_from_the_handler() {
     let mut client = Client::new();
     client.initialize(&[]);
-    // An answer to the request the failed `initialize` never sent.
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": null }));
     client.notify("exit", Value::Null);
     let handler = EagerInit {
         fail: true,
@@ -1608,8 +1874,12 @@ fn test_failed_initialize_sends_nothing_from_the_handler_and_forgets_its_request
             .all(|m| m["method"] != "window/showMessage"
                 && m["method"] != "window/showMessageRequest")
     );
-    assert!(server.handler().responses.is_empty());
-    assert_eq!(logs(&out).len(), 1); // the stray answer
+    // The request it tried to send was never sent; its outcome is a
+    // cancellation, delivered to the handler.
+    assert_eq!(
+        server.handler().responses,
+        [(1, ResponseError::REQUEST_CANCELLED)]
+    );
 }
 
 #[test]
@@ -1619,25 +1889,30 @@ fn test_outstanding_requests_are_capped_by_cancelling_the_oldest() {
         ask: CAP as usize + 3,
         ..Bomb::default()
     };
-    let mut client = Client::new();
-    client.initialize(&[]);
+    let mut live = Live::start(serve(Lisp, bomb));
+    live.initialize(&[]);
+    let alive = live.request("custom/alive", json!({}));
+    live.recv_response(alive);
     // An answer to a cancelled request is dropped; the newest still lands.
-    client.send(&json!({ "jsonrpc": "2.0", "id": 0, "result": "late" }));
-    client.send(&json!({ "jsonrpc": "2.0", "id": CAP + 2, "result": "on time" }));
-    client.shutdown();
-    let (server, result, out) = run(bomb, &client);
+    live.send(&json!({ "jsonrpc": "2.0", "id": 1, "result": "late" }));
+    live.send(&json!({ "jsonrpc": "2.0", "id": CAP + 3, "result": "on time" }));
+    let alive = live.request("custom/alive", json!({}));
+    live.recv_response(alive);
+    live.shutdown();
+    let (result, server, rest) = live.finish();
     assert!(result.is_ok());
-    let sent = out
+    let seen: Vec<&Value> = rest.iter().collect();
+    let sent = seen
         .iter()
         .filter(|m| m["method"] == "workspace/configuration")
         .count();
     assert_eq!(sent, CAP as usize + 3);
-    let cancels: Vec<&Value> = out
+    let cancels: Vec<&Value> = seen
         .iter()
         .filter(|m| m["method"] == "$/cancelRequest")
         .map(|m| &m["params"]["id"])
         .collect();
-    assert_eq!(cancels, [&json!(0), &json!(1), &json!(2)]);
+    assert_eq!(cancels, [&json!(1), &json!(2), &json!(3)]);
     let responses: Vec<&str> = server
         .handler()
         .calls
@@ -1646,16 +1921,16 @@ fn test_outstanding_requests_are_capped_by_cancelling_the_oldest() {
         .collect();
     let cancelled = ResponseError::REQUEST_CANCELLED;
     let expected = [
-        format!("0 err {cancelled}"),
         format!("1 err {cancelled}"),
         format!("2 err {cancelled}"),
-        format!("{} ok \"on time\"", CAP + 2),
+        format!("3 err {cancelled}"),
+        format!("{} ok \"on time\"", CAP + 3),
     ];
     assert_eq!(responses, expected);
     // Besides the handler's own "starting", only the late answer is logged.
-    let warnings: Vec<(i64, String)> = logs(&out).into_iter().filter(|l| l.0 == 2).collect();
+    let warnings: Vec<(i64, String)> = logs(&rest).into_iter().filter(|l| l.0 == 2).collect();
     assert_eq!(warnings.len(), 1);
-    assert!(warnings[0].1.contains("id 0"));
+    assert!(warnings[0].1.contains("id 1"));
 }
 
 #[test]
@@ -1665,7 +1940,7 @@ fn test_malformed_request_with_a_valid_id_is_answered_under_that_id() {
     client.send_raw(r#"{"jsonrpc":"2.0","id":7,"method":42}"#);
     client.send_raw(r#"{"jsonrpc":"2.0","id":"s-1","method":{"a":1}}"#);
     client.send_raw(r#"{"jsonrpc":"2.0","id":7.5,"method":42}"#);
-    client.request("test/echo", json!("alive")).shutdown();
+    client.request("test/echo", json!(["alive"])).shutdown();
     let (_, result, out) = run(recorder(), &client);
     assert!(result.is_ok());
     let invalid: Vec<&Value> = out
@@ -1674,5 +1949,5 @@ fn test_malformed_request_with_a_valid_id_is_answered_under_that_id() {
         .map(|m| &m["id"])
         .collect();
     assert_eq!(invalid, [&json!(7), &json!("s-1"), &Value::Null]);
-    assert_eq!(response(&out, 2)["result"], "alive");
+    assert_eq!(response(&out, 2)["result"], json!(["alive"]));
 }

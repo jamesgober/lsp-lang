@@ -1,5 +1,5 @@
 //! A small, complete language server shared by the examples, the integration
-//! tests, and the benchmarks — and a template for wiring a real language.
+//! tests, and the benchmarks, and a template for wiring a real language.
 //!
 //! The language is a tiny Lisp:
 //!
@@ -12,8 +12,9 @@
 //! [`Lisp`] is its grammar (every list reparses on its own). [`analyze`] finds
 //! syntax and name errors, resolving names with `symbol-lang` and reporting
 //! them with its ready-made diagnostics. [`LispServer`] is the handler:
-//! diagnostics on every change, hover, and go-to-definition. [`Client`] and
-//! [`messages`] script a session in memory and read the server's replies.
+//! diagnostics on every change, hover, go-to-definition, completion, an
+//! outline, and semantic tokens. [`Client`] and [`messages`] script a session
+//! in memory and read the server's replies.
 
 #![allow(dead_code)] // Each example uses a different subset.
 
@@ -23,9 +24,10 @@ use intern_lang::Interner;
 use lsp_lang::diag_lang::{Label, Severity};
 use lsp_lang::incremental_lang::{Builder, Element, Grammar, Node, Span, Token, TokenKind, Tree};
 use lsp_lang::{
-    Context, Diagnostic, Document, Handler, Json, Position, Reply, ResponseError, Value, json,
+    CompletionItem, CompletionItemKind, Context, Diagnostic, Document, DocumentSymbol, Features,
+    Handler, Hover, Location, Position, ResponseError, SemanticTokens, SemanticTokensBuilder,
+    SemanticTokensLegend, SymbolKind, Value, json,
 };
-use serde::Deserialize;
 use symbol_lang::{SymbolTable, duplicate_definition, unresolved_name};
 
 // ---------------------------------------------------------------------------
@@ -119,7 +121,7 @@ fn list(b: &mut Builder<'_, Kind>) {
     b.start(Kind::List);
     b.bump(); // `(`
     // Test for the closer before the end, so a balanced list never looks past
-    // its own `)` — the check that lets incremental-lang reparse it alone.
+    // its own `)`: the check that lets incremental-lang reparse it alone.
     while !b.at(Kind::Close) && !b.at_end() {
         if b.at(Kind::Open) { list(b) } else { b.bump() }
     }
@@ -152,6 +154,10 @@ pub struct Analysis {
     pub diagnostics: Vec<Diagnostic>,
     /// Every atom, in text order, with what it means.
     pub atoms: Vec<(Span, Meaning)>,
+    /// Every comment, in text order.
+    pub comments: Vec<Span>,
+    /// The names defined, in text order.
+    pub definitions: Vec<(String, Span)>,
 }
 
 impl Analysis {
@@ -239,11 +245,21 @@ pub fn analyze(text: &str, tree: &Tree<Kind>) -> Analysis {
             );
         } else {
             let _previous = table.define(symbol, name.span());
+            analysis
+                .definitions
+                .push((spelling.to_owned(), name.span()));
         }
     }
 
-    for token in root.tokens().filter(|t| *t.kind() == Kind::Atom) {
+    for token in root.tokens() {
         let span = token.span();
+        if *token.kind() == Kind::Comment {
+            analysis.comments.push(span);
+            continue;
+        }
+        if *token.kind() != Kind::Atom {
+            continue;
+        }
         let spelling = text_of(text, span);
         let meaning = if spelling.parse::<f64>().is_ok() {
             Meaning::Number
@@ -269,24 +285,19 @@ pub fn analyze(text: &str, tree: &Tree<Kind>) -> Analysis {
 // The handler
 // ---------------------------------------------------------------------------
 
-/// The parameters of `textDocument/hover` and `textDocument/definition`.
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PositionParams<'a> {
-    #[serde(borrow)]
-    pub text_document: DocumentId<'a>,
-    pub position: Position,
+/// The semantic-token legend of the Lisp server.
+pub fn legend() -> SemanticTokensLegend {
+    SemanticTokensLegend::new(
+        &["keyword", "number", "variable", "comment"],
+        &["declaration"],
+    )
 }
 
-#[derive(Deserialize)]
-pub struct DocumentId<'a> {
-    pub uri: &'a str,
-}
-
-/// The Lisp language server: diagnostics, hover, and go-to-definition.
+/// The Lisp language server: diagnostics, hover, go-to-definition,
+/// completion, an outline, and semantic tokens.
 ///
-/// It keeps the latest analysis of each open document, so hover and
-/// definition answer from it without reanalysing.
+/// It keeps the latest analysis of each open document, so every request
+/// answers from it without reanalysing.
 #[derive(Debug, Default)]
 pub struct LispServer {
     analyses: HashMap<String, Analysis>,
@@ -295,12 +306,13 @@ pub struct LispServer {
 }
 
 impl Handler<Lisp> for LispServer {
-    fn initialize(
-        &mut self,
-        _: Json<'_>,
-        _: &mut Context<'_, Lisp>,
-    ) -> Result<Value, ResponseError> {
-        Ok(json!({ "hoverProvider": true, "definitionProvider": true }))
+    fn features(&self) -> Features {
+        Features::new()
+            .hover()
+            .definition()
+            .completion(&["(", " "])
+            .document_symbols()
+            .semantic_tokens(legend())
     }
 
     fn changed(&mut self, doc: &Document<Lisp>, cx: &mut Context<'_, Lisp>) {
@@ -315,71 +327,165 @@ impl Handler<Lisp> for LispServer {
         cx.clear_diagnostics(uri);
     }
 
-    fn request(
+    fn hover(
         &mut self,
-        method: &str,
-        params: Json<'_>,
-        cx: &mut Context<'_, Lisp>,
-    ) -> Result<Reply, ResponseError> {
-        match method {
-            "textDocument/hover" => {
-                let p: PositionParams<'_> = params.parse()?;
-                let Some((doc, (span, meaning))) = self.lookup(cx, &p) else {
-                    return Ok(Reply::null());
-                };
-                let name = text_of(doc.text(), span);
-                let contents = match meaning {
-                    Meaning::Defined(at) => {
-                        format!(
-                            "`{name}`: defined on line {}",
-                            doc.position(at.start().to_u32()).line + 1
-                        )
-                    }
-                    Meaning::Builtin => format!("`{name}`: builtin"),
-                    Meaning::Number => format!("`{name}`: number"),
-                    Meaning::Unresolved => format!("`{name}`: not defined"),
-                };
-                Ok(Reply::new(&json!({
-                    "contents": { "kind": "markdown", "value": contents },
-                    "range": doc.range(span),
-                }))?)
+        doc: &Document<Lisp>,
+        at: Position,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<Option<Hover>, ResponseError> {
+        let Some((span, meaning)) = self.atom_at(doc, at) else {
+            return Ok(None);
+        };
+        let name = text_of(doc.text(), span);
+        let contents = match meaning {
+            Meaning::Defined(at) => {
+                format!(
+                    "`{name}`: defined on line {}",
+                    doc.position(at.start().to_u32()).line + 1
+                )
             }
-            "textDocument/definition" => {
-                let p: PositionParams<'_> = params.parse()?;
-                match self.lookup(cx, &p) {
-                    Some((doc, (_, Meaning::Defined(at)))) => Ok(Reply::new(
-                        &json!({ "uri": doc.uri(), "range": doc.range(at) }),
-                    )?),
-                    _ => Ok(Reply::null()),
-                }
+            Meaning::Builtin => format!("`{name}`: builtin"),
+            Meaning::Number => format!("`{name}`: number"),
+            Meaning::Unresolved => format!("`{name}`: not defined"),
+        };
+        Ok(Some(Hover::markdown(contents).with_range(doc.range(span))))
+    }
+
+    fn definition(
+        &mut self,
+        doc: &Document<Lisp>,
+        at: Position,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<Vec<Location>, ResponseError> {
+        Ok(match self.atom_at(doc, at) {
+            Some((_, Meaning::Defined(defined))) => {
+                vec![Location::new(doc.uri(), doc.range(defined))]
             }
-            _ => Err(ResponseError::new(
-                ResponseError::METHOD_NOT_FOUND,
-                format!("unhandled method `{method}`"),
-            )),
+            _ => Vec::new(),
+        })
+    }
+
+    fn completion(
+        &mut self,
+        doc: &Document<Lisp>,
+        _: Position,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<Vec<CompletionItem>, ResponseError> {
+        let mut items: Vec<CompletionItem> = BUILTINS
+            .iter()
+            .map(|b| CompletionItem::new(*b).with_kind(CompletionItemKind::Keyword))
+            .collect();
+        if let Some(analysis) = self.analyses.get(doc.uri()) {
+            items.extend(analysis.definitions.iter().map(|(name, at)| {
+                CompletionItem::new(name.as_str())
+                    .with_kind(CompletionItemKind::Variable)
+                    .with_detail(format!(
+                        "line {}",
+                        doc.position(at.start().to_u32()).line + 1
+                    ))
+            }));
         }
+        Ok(items)
+    }
+
+    fn document_symbols(
+        &mut self,
+        doc: &Document<Lisp>,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<Vec<DocumentSymbol>, ResponseError> {
+        Ok(symbols(doc, doc.tree().root(), 0))
+    }
+
+    fn semantic_tokens(
+        &mut self,
+        doc: &Document<Lisp>,
+        _: &mut Context<'_, Lisp>,
+    ) -> Result<SemanticTokens, ResponseError> {
+        let mut tokens = SemanticTokensBuilder::new(doc);
+        if let Some(analysis) = self.analyses.get(doc.uri()) {
+            let legend = legend();
+            let (keyword, number, variable, comment) = (
+                legend.token_type("keyword").unwrap_or(0),
+                legend.token_type("number").unwrap_or(0),
+                legend.token_type("variable").unwrap_or(0),
+                legend.token_type("comment").unwrap_or(0),
+            );
+            for &(span, meaning) in &analysis.atoms {
+                let kind = match meaning {
+                    Meaning::Builtin => keyword,
+                    Meaning::Number => number,
+                    Meaning::Defined(_) | Meaning::Unresolved => variable,
+                };
+                tokens.push(span, kind, 0);
+            }
+            for &span in &analysis.comments {
+                tokens.push(span, comment, 0);
+            }
+        }
+        Ok(tokens.build())
     }
 }
 
 impl LispServer {
-    /// The open document and the atom at a request's position.
-    fn lookup<'a>(
-        &self,
-        cx: &Context<'a, Lisp>,
-        p: &PositionParams<'_>,
-    ) -> Option<(&'a Document<Lisp>, (Span, Meaning))> {
-        let doc = cx.document(p.text_document.uri)?;
-        let atom = self
-            .analyses
-            .get(doc.uri())?
-            .atom_at(doc.offset(p.position))?;
-        Some((doc, atom))
+    /// The atom at a request's position in `doc`.
+    fn atom_at(&self, doc: &Document<Lisp>, at: Position) -> Option<(Span, Meaning)> {
+        self.analyses.get(doc.uri())?.atom_at(doc.offset(at))
     }
+}
+
+/// The outline of a list: each `(define name …)` inside it, with the defines
+/// nested in its value as children. Depth-limited, since the tree is the
+/// client's text.
+fn symbols(doc: &Document<Lisp>, node: Node<'_, Kind>, depth: usize) -> Vec<DocumentSymbol> {
+    if depth > 32 {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for child in significant(node) {
+        let Element::Node(list) = child else { continue };
+        if list.kind() != Kind::List {
+            continue;
+        }
+        let mut parts = significant(list).skip(1);
+        let (Some(head), Some(name)) = (parts.next(), parts.next()) else {
+            found.extend(symbols(doc, list, depth + 1));
+            continue;
+        };
+        if head.kind() == Kind::Atom
+            && text_of(doc.text(), head.span()) == "define"
+            && name.kind() == Kind::Atom
+        {
+            let is_function = parts.next().is_some_and(|v| v.kind() == Kind::List);
+            let kind = if is_function {
+                SymbolKind::Function
+            } else {
+                SymbolKind::Variable
+            };
+            let mut symbol = DocumentSymbol::new(
+                text_of(doc.text(), name.span()),
+                kind,
+                doc.range(list.span()),
+                doc.range(name.span()),
+            );
+            symbol.children = symbols(doc, list, depth + 1);
+            found.push(symbol);
+        } else {
+            found.extend(symbols(doc, list, depth + 1));
+        }
+    }
+    found
 }
 
 // ---------------------------------------------------------------------------
 // Scripting a session
 // ---------------------------------------------------------------------------
+
+/// Frames `body` as the base protocol does.
+pub fn frame(body: &str) -> Vec<u8> {
+    let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    out.extend_from_slice(body.as_bytes());
+    out
+}
 
 /// Builds the byte stream an editor would send.
 #[derive(Default)]
@@ -394,47 +500,51 @@ impl Client {
     }
 
     /// Appends one framed message.
-    pub fn send(&mut self, message: &Value) -> &mut Self {
-        let body = message.to_string();
-        self.bytes
-            .extend_from_slice(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes());
-        self.bytes.extend_from_slice(body.as_bytes());
+    pub fn send(&mut self, message: &Value<'_>) -> &mut Self {
+        self.bytes.extend_from_slice(&frame(&message.to_string()));
         self
     }
 
-    /// Appends one framed message with `body` exactly as given — for
-    /// malformed JSON, which a `Value` cannot represent.
+    /// Appends one framed message with `body` exactly as given, for malformed
+    /// JSON, which a `Value` cannot represent.
     pub fn send_raw(&mut self, body: &str) -> &mut Self {
-        self.bytes.extend_from_slice(
-            format!(
-                "Content-Length: {}
+        self.bytes.extend_from_slice(&frame(body));
+        self
+    }
 
-",
-                body.len()
-            )
-            .as_bytes(),
-        );
-        self.bytes.extend_from_slice(body.as_bytes());
+    /// Appends bytes exactly as given, framing and all.
+    pub fn send_bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        self.bytes.extend_from_slice(bytes);
         self
     }
 
     /// Appends a request with the next id.
-    pub fn request(&mut self, method: &str, params: Value) -> &mut Self {
+    pub fn request(&mut self, method: &str, params: Value<'_>) -> &mut Self {
         self.next_id += 1;
         let id = self.next_id;
         self.send(&json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
     }
 
+    /// The id the most recent request was sent with.
+    pub fn last_id(&self) -> u64 {
+        self.next_id
+    }
+
     /// Appends a notification.
-    pub fn notify(&mut self, method: &str, params: Value) -> &mut Self {
+    pub fn notify(&mut self, method: &str, params: Value<'_>) -> &mut Self {
         self.send(&json!({ "jsonrpc": "2.0", "method": method, "params": params }))
+    }
+
+    /// `$/cancelRequest` for request `id`.
+    pub fn cancel(&mut self, id: u64) -> &mut Self {
+        self.notify("$/cancelRequest", json!({ "id": id }))
     }
 
     /// `initialize` (offering `encodings`), then `initialized`.
     pub fn initialize(&mut self, encodings: &[&str]) -> &mut Self {
         self.request(
             "initialize",
-            json!({ "capabilities": { "general": { "positionEncodings": encodings } } }),
+            json!({ "capabilities": { "general": { "positionEncodings": encodings.to_vec() } } }),
         )
         .notify("initialized", json!({}))
     }
@@ -470,11 +580,17 @@ impl Client {
         )
     }
 
+    /// A request that takes a position, such as hover.
     pub fn at(&mut self, method: &str, uri: &str, line: u32, character: u32) -> &mut Self {
         self.request(
             method,
             json!({ "textDocument": { "uri": uri }, "position": { "line": line, "character": character } }),
         )
+    }
+
+    /// A request that takes only a document, such as `documentSymbol`.
+    pub fn of(&mut self, method: &str, uri: &str) -> &mut Self {
+        self.request(method, json!({ "textDocument": { "uri": uri } }))
     }
 
     /// `shutdown`, then `exit`.
@@ -489,7 +605,7 @@ impl Client {
 }
 
 /// Splits a server's output into its JSON messages.
-pub fn messages(output: &[u8]) -> Vec<Value> {
+pub fn messages(output: &[u8]) -> Vec<Value<'static>> {
     let mut found = Vec::new();
     let mut rest = output;
     while let Some(split) = rest.windows(4).position(|w| w == b"\r\n\r\n") {
@@ -501,9 +617,20 @@ pub fn messages(output: &[u8]) -> Vec<Value> {
         else {
             break;
         };
-        let body = &rest[split + 4..split + 4 + len];
-        found.push(serde_json::from_slice(body).unwrap_or(Value::Null));
+        let Some(body) = rest.get(split + 4..split + 4 + len) else {
+            break;
+        };
+        // A batch response is an array of responses; read it as its members.
+        match jsonx_lib_parse(body) {
+            Value::Array(members) => found.extend(members.into_vec()),
+            other => found.push(other),
+        }
         rest = &rest[split + 4 + len..];
     }
     found
+}
+
+/// Parses one message body; `null` for anything that is not JSON.
+fn jsonx_lib_parse(body: &[u8]) -> Value<'static> {
+    lsp_lang::jsonx_lib::parse_bytes(body).map_or(Value::Null, Value::into_owned)
 }

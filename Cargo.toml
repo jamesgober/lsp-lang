@@ -3,7 +3,7 @@
 # =============================================================================
 [package]
 name    = "lsp-lang"
-version = "1.0.1"
+version = "2.0.0"
 
 # Minimum Supported Rust Version (MSRV)
 rust-version = "1.85"
@@ -16,7 +16,7 @@ license = "Apache-2.0 OR MIT"
 readme = "README.md"
 
 # Description
-description = "Language Server Protocol scaffolding: JSON-RPC transport, server lifecycle, incremental document sync, and diagnostics publishing."
+description = "Language Server Protocol scaffolding on our own stack: server lifecycle, incremental document sync, diagnostics, and typed semantic tokens, symbols, hover, definition, and completion. No third-party dependencies."
 
 # Keywords (5 max)
 keywords = ["lsp", "language-server", "editor", "language", "tooling"]
@@ -53,16 +53,15 @@ incremental-lang = { version = "1", default-features = false, features = ["std"]
 # built on diag-lang (lexer, parser, resolver, checker) publishes as-is. Only
 # the type is used; the terminal renderer's colour support is left off.
 diag-lang = { version = "1", default-features = false, features = ["std"] }
-# The wire format. JSON-RPC envelopes are parsed in place, borrowing method
-# names and keeping parameters as raw JSON (`raw_value`) until a handler asks
-# for them in the type it wants, so no intermediate value tree is ever built.
-serde_json = { version = "1", features = ["raw_value"] }
-# Derives the private, borrowing deserializers for the messages the server
-# handles itself (initialize, document open/change/close, responses).
-serde = { version = "1", features = ["derive"] }
-# SIMD search for line breaks when indexing a document's lines. Already in the
-# dependency graph through `serde_json`.
-memchr = "2"
+# JSON-RPC 2.0 over the base protocol's `Content-Length` framing: the decoder,
+# the envelope, error codes, batches, id correlation for the server's own
+# requests, and `$/cancelRequest`. The family's transport; its framing is
+# exactly LSP's.
+rpc-io = "0.2"
+# The family's JSON: a borrowing parser with budgets, a pull reader, and a
+# deterministic writer. Re-exported, since its `Value` is how a handler reads
+# parameters and answers custom requests.
+jsonx-lib = "0.2"
 
 
 # DEV DEPENDENCIES

@@ -1,5 +1,5 @@
-//! A complete language server for a tiny Lisp: live diagnostics, hover, and
-//! go-to-definition.
+//! A complete language server for a tiny Lisp: live diagnostics, hover,
+//! go-to-definition, completion, an outline, and semantic tokens.
 //!
 //! By default it plays a scripted editor session in memory and prints what the
 //! server sent back. With `--stdio` it serves a real editor instead:
@@ -48,6 +48,9 @@ fn main() -> ExitCode {
         // Hover over `width` on line 3, then jump to its definition.
         .at("textDocument/hover", URI, 2, 17)
         .at("textDocument/definition", URI, 2, 17)
+        // Ask for the outline and the highlighting.
+        .of("textDocument/documentSymbol", URI)
+        .of("textDocument/semanticTokens/full", URI)
         // Define the missing `height` by typing a new line 2.
         .edit(URI, 2, (2, 0), (2, 0), "(define height 25)\n")
         // Break the syntax: delete the `)` that closes `(print area)`.
@@ -71,11 +74,11 @@ fn main() -> ExitCode {
 }
 
 /// Prints one server message as a line or two of plain text.
-fn describe(message: &Value) {
+fn describe(message: &Value<'_>) {
     if message["method"] == "textDocument/publishDiagnostics" {
         let found = message["params"]["diagnostics"]
             .as_array()
-            .map_or(&[][..], Vec::as_slice);
+            .map_or(&[][..], |list| list.as_slice());
         let version = &message["params"]["version"];
         match found.len() {
             0 => println!("diagnostics for version {version}: none"),
