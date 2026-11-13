@@ -766,3 +766,114 @@ proptest! {
         prop_assert!(out.iter().any(|m| m["id"] == probe && m.get("result").is_some()));
     }
 }
+
+/// Messages that refuse a document for the server's document caps.
+fn refusals(out: &[Value<'static>]) -> Vec<String> {
+    out.iter()
+        .filter(|m| m["method"] == "window/logMessage")
+        .filter_map(|m| m["params"]["message"].as_str().map(str::to_owned))
+        .filter(|m| m.contains("the most this server holds"))
+        .collect()
+}
+
+fn diagnosed(out: &[Value<'static>], uri: &str) -> bool {
+    out.iter()
+        .any(|m| m["method"] == "textDocument/publishDiagnostics" && m["params"]["uri"] == uri)
+}
+
+#[test]
+fn test_open_documents_are_capped_by_default() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    for i in 0..=4_096 {
+        client.open(&format!("file:///cap/{i}.lisp"), "(a)");
+    }
+    client.shutdown();
+    let (result, out) = run(client.bytes());
+    assert!(result.is_ok());
+    assert_eq!(refusals(&out).len(), 1);
+    assert!(diagnosed(&out, "file:///cap/4095.lisp"));
+    assert!(!diagnosed(&out, "file:///cap/4096.lisp"));
+}
+
+#[test]
+fn test_the_document_count_cap_refuses_and_closing_frees_room() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    client.open("file:///a.lisp", "(a)");
+    client.open("file:///b.lisp", "(b)");
+    client.open("file:///c.lisp", "(c)"); // over the cap of two
+    client.open("file:///a.lisp", "(a a)"); // reopening a held document is fine
+    client.notify(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": "file:///b.lisp" } }),
+    );
+    client.open("file:///d.lisp", "(d)"); // room again
+    client.shutdown();
+
+    let mut output = Vec::new();
+    let result = serve()
+        .with_document_limit(2, 1 << 20)
+        .run(client.bytes(), &mut output);
+    let out = messages(&output);
+    assert!(result.is_ok());
+    assert_eq!(refusals(&out).len(), 1);
+    assert!(!diagnosed(&out, "file:///c.lisp"));
+    assert!(diagnosed(&out, "file:///d.lisp"));
+}
+
+#[test]
+fn test_the_byte_cap_refuses_large_opens_and_growing_edits() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    client.open("file:///a.lisp", &"(a)".repeat(10)); // 30 bytes
+    client.open("file:///big.lisp", &"(b)".repeat(30)); // 90 more: over 100
+    client.open("file:///b.lisp", &"(b)".repeat(20)); // 60 more: 90 held
+    // An edit that would add 20 bytes, to 110, is refused; the document is kept.
+    client.edit("file:///b.lisp", 2, (0, 0), (0, 0), &"(c)".repeat(7));
+    client.shutdown();
+
+    let mut output = Vec::new();
+    let result = serve()
+        .with_document_limit(16, 100)
+        .run(client.bytes(), &mut output);
+    let out = messages(&output);
+    assert!(result.is_ok());
+    let refused = refusals(&out);
+    assert_eq!(refused.len(), 2, "{refused:?}");
+    assert!(refused[0].contains("big.lisp"));
+    assert!(refused[1].contains("b.lisp") && refused[1].contains("out of step"));
+    assert!(!diagnosed(&out, "file:///big.lisp"));
+}
+
+#[test]
+fn test_shrinking_edits_and_closes_return_bytes_to_the_budget() {
+    let mut client = Client::new();
+    client.initialize(&[]);
+    client.open("file:///a.lisp", &"(a)".repeat(30)); // 90 bytes
+    // Replace the whole text with 3 bytes: 3 held.
+    client.notify(
+        "textDocument/didChange",
+        json!({
+            "textDocument": { "uri": "file:///a.lisp", "version": 2 },
+            "contentChanges": [{ "text": "(a)" }],
+        }),
+    );
+    client.open("file:///b.lisp", &"(b)".repeat(30)); // 93 held: fits
+    client.notify(
+        "textDocument/didClose",
+        json!({ "textDocument": { "uri": "file:///b.lisp" } }),
+    );
+    client.open("file:///c.lisp", &"(c)".repeat(32)); // 99 held: fits
+    client.shutdown();
+
+    let mut output = Vec::new();
+    let result = serve()
+        .with_document_limit(16, 100)
+        .run(client.bytes(), &mut output);
+    let out = messages(&output);
+    assert!(result.is_ok());
+    assert_eq!(refusals(&out), Vec::<String>::new());
+    assert!(diagnosed(&out, "file:///b.lisp"));
+    assert!(diagnosed(&out, "file:///c.lisp"));
+}

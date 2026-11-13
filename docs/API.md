@@ -27,6 +27,7 @@
 - [`Server`](#server)
   - [`Server::new`](#servernew)
   - [`Server::with_message_limit`](#serverwith_message_limit)
+  - [`Server::with_document_limit`](#serverwith_document_limit)
   - [`Server::with_info`](#serverwith_info)
   - [`Server::custom_request`](#servercustom_request), [`Server::custom_notification`](#servercustom_notification)
   - [`Server::handler`](#serverhandler)
@@ -428,7 +429,7 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> { /* ... */ }
 The protocol engine around a [`Handler`](#handler): transport, lifecycle,
 document synchronization, the typed features, and cancellation. `G` is the
 grammar every document is parsed with (cloned per document; a unit struct costs
-nothing). `Debug` shows the message limit.
+nothing). `Debug` shows the message and document limits.
 
 ### `Server::new`
 
@@ -436,7 +437,8 @@ nothing). `Debug` shows the message limit.
 pub fn new(grammar: G, handler: H) -> Server<G, H>
 ```
 
-Creates a server. The default message limit is 256 MiB.
+Creates a server. The default message limit is 64 MiB, and the default
+document limit is 4096 open documents holding 512 MiB of text between them.
 
 ```rust
 # use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
@@ -505,6 +507,53 @@ let input = "Content-Length: 17\r\n\r\n{\"jsonrpc\":\"2.0\"}";
 let mut output = Vec::new();
 assert!(matches!(server.run(input.as_bytes(), &mut output), Err(Error::Disconnected)));
 assert!(String::from_utf8_lossy(&output).contains("too large"));
+```
+
+### `Server::with_document_limit`
+
+```rust,ignore
+pub fn with_document_limit(self, documents: usize, bytes: usize) -> Server<G, H>
+```
+
+Sets the most documents the server holds open at once, and the most bytes of
+text they may hold between them. The defaults are 4096 documents and 512 MiB.
+Each open document costs its text plus its syntax tree, and the client decides
+how many to open, so the server caps both:
+
+- A `didOpen` past either cap is refused with a `window/logMessage` (type
+  `Error`), and the document stays closed. Reopening a document already open is
+  not a new document, so only the byte cap applies to it.
+- A `didChange` that could grow the text past the byte cap is refused the same
+  way. The document is kept at its last version, out of step, until the client
+  sends its whole text again or reopens it.
+- Closing a document frees its room. A document whose `didOpen` failed counts
+  toward the document cap until it is closed.
+
+```rust
+# use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
+# #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+# enum K { Root, Text }
+# impl TokenKind for K {}
+# #[derive(Clone)]
+# struct Plain;
+# impl Grammar for Plain {
+#     type Kind = K;
+#     const ROOT: K = K::Root;
+#     fn lex(&self, t: &str, out: &mut Vec<Token<K>>) {
+#         if !t.is_empty() { out.push(Token::new(K::Text, Span::new(0, t.len() as u32))); }
+#     }
+#     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
+#         b.start(K::Root);
+#         while !b.at_end() { b.bump(); }
+#         b.finish();
+#     }
+# }
+# struct SyncOnly;
+# impl lsp_lang::Handler<Plain> for SyncOnly {}
+use lsp_lang::Server;
+
+// A server for a shared host: at most 64 documents, 16 MiB between them.
+let server = Server::new(Plain, SyncOnly).with_document_limit(64, 16 << 20);
 ```
 
 ### `Server::with_info`

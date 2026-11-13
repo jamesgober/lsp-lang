@@ -11,13 +11,28 @@
 
 ## [Unreleased]
 
+---
+
+## [2.1.0] - 2026-11-12
+
+The server had no limit on how many documents a client could open, so a client
+that kept opening documents could make it hold any amount of text and syntax
+trees. It now caps both.
+
 ### Added
+
+- `Server::with_document_limit(documents, bytes)`: the most documents held open
+  at once and the most bytes of text between them. The defaults are 4096
+  documents and 512 MiB. A `didOpen` past either cap, or a `didChange` that
+  would grow the text past the byte cap, is refused with a `window/logMessage`.
+  A refused change keeps the document at its last version, out of step, until
+  the client sends its whole text again.
 
 ### Changed
 
-### Fixed
-
-### Security
+- The default message limit is now 64 MiB, down from 256 MiB. That is still far
+  above any source file an editor sends, and `with_message_limit` raises it.
+  The default was never part of the stability promise.
 
 ---
 
@@ -376,7 +391,8 @@ Initial scaffold and repository bootstrap. No domain logic yet &mdash; this rele
 - `.github/workflows/ci.yml` CI matrix; `deny.toml`, `clippy.toml`, `rustfmt.toml`.
 - `dev/DIRECTIVES.md` and `dev/ROADMAP.md` (committed engineering standards + plan).
 
-[Unreleased]: https://github.com/jamesgober/lsp-lang/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/jamesgober/lsp-lang/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/jamesgober/lsp-lang/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/jamesgober/lsp-lang/compare/v1.0.1...v2.0.0
 [1.0.1]: https://github.com/jamesgober/lsp-lang/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/jamesgober/lsp-lang/compare/v0.2.0...v1.0.0
