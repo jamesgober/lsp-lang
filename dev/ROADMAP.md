@@ -116,7 +116,7 @@ benchmarks green on Windows and Linux (WSL2) locally; macOS through the CI
 matrix.
 
 ## v1.0.1 - Robustness patch (DONE)
-Fixes ISSUES M74 and M75 in `lang-collection/_lexersketch/ISSUES.md`. No
+Fixes ISSUES M74 and M75 in the issue ledger. No
 public API added or removed.
 - [x] A failed `didChange` never loses the document; recovery documented.
 - [x] Every handler call contained; `initialize` output ordered; outstanding
@@ -175,8 +175,8 @@ Additive 1.x candidates (not commitments):
 
 ## v2.0.0 - Our own stack (DONE)
 Removes every third-party runtime dependency (`serde`, `serde_json`, `memchr`)
-by rebuilding on `rpc-io` and `jsonx-lib` (LexerSketch decisions D25 and D29),
-and adds the typed features LexerSketch's `lsk lsp` needs. A major release:
+by rebuilding on `rpc-io` and `jsonx-lib` (decisions D25 and D29),
+and adds the typed features the toolchain's `lsk lsp` needs. A major release:
 the breaking changes and a migration table are in `CHANGELOG.md`.
 - [x] `serde`, `serde_json`, and `memchr` removed completely; zero third-party
       runtime dependencies (`cargo tree --edges normal` lists only family crates).
@@ -243,7 +243,7 @@ Not delivered, and why (candidates for 2.x, all additive):
 - `Document::is_in_step()` as a public method.
 - UTF-32 position encoding.
 - `semanticTokens/range`, `textDocument/references`, `rename`, `codeAction`,
-  `formatting`, workspace symbols: nothing LexerSketch needs yet; `Features::capability`
+  `formatting`, workspace symbols: nothing the toolchain needs yet; `Features::capability`
   plus `Handler::request` carry any of them meanwhile.
 - Coalescing several queued `didChange`s of one document into one `changed`
   call (the queue makes it possible; not done, since each change is observable).
