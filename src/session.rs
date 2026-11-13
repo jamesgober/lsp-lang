@@ -51,6 +51,16 @@ struct Cached {
     data: Vec<u32>,
 }
 
+/// How many documents a session holds open, and how much text they may hold
+/// between them. Set by [`Server::with_document_limit`](crate::Server::with_document_limit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DocumentLimit {
+    /// Most documents open at once, counting ones whose `didOpen` failed.
+    pub(crate) count: usize,
+    /// Most bytes of text held across every open document.
+    pub(crate) bytes: usize,
+}
+
 /// The state of one [`Server::run`](crate::Server::run).
 pub(crate) struct Session<'h, G: Grammar, H> {
     grammar: G,
@@ -65,6 +75,10 @@ pub(crate) struct Session<'h, G: Grammar, H> {
     /// workspace, by the documents the client holds open.
     unopened: BTreeSet<Box<str>>,
     semantic: BTreeMap<Box<str>, Cached>,
+    /// The cap on open documents and the text they hold.
+    limit: DocumentLimit,
+    /// Bytes of text held across the workspace, kept in step with it.
+    held: usize,
     next_result: u64,
     pub(crate) wire: Wire,
     /// Set by `exit`: how the session ended.
@@ -77,6 +91,7 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
         handler: &'h mut H,
         wire: Wire,
         info: Option<(String, String)>,
+        limit: DocumentLimit,
     ) -> Self {
         Self {
             grammar,
@@ -88,6 +103,8 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
             workspace: Workspace::new(),
             unopened: BTreeSet::new(),
             semantic: BTreeMap::new(),
+            limit,
+            held: 0,
             next_result: 0,
             wire,
             finished: None,
@@ -379,12 +396,35 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
     // ----- Document synchronization ---------------------------------------
 
     fn did_open(&mut self, uri: String, version: i32, text: String) {
+        let replacing = self.workspace.get(uri.as_str()).map(|d| d.text().len());
+        let known = replacing.is_some() || self.unopened.contains(uri.as_str());
+        if !known && self.workspace.len() + self.unopened.len() >= self.limit.count {
+            let message = format!(
+                "could not open `{uri}`: {} documents are already open, the most this server holds",
+                self.limit.count
+            );
+            return self.wire.log(MessageType::Error, &message);
+        }
+        let held = self.held - replacing.unwrap_or(0);
+        if held.saturating_add(text.len()) > self.limit.bytes {
+            let message = format!(
+                "could not open `{uri}`: its {} bytes would take the open documents past {} bytes, \
+                 the most this server holds",
+                text.len(),
+                self.limit.bytes
+            );
+            if let Some(document) = self.workspace.get_mut(uri.as_str()) {
+                document.mark_stale();
+            }
+            return self.wire.log(MessageType::Error, &message);
+        }
         let grammar = self.grammar.clone();
         let encoding = self.encoding;
         match guarded(|| Document::open(grammar, &uri, version, text, encoding)) {
             Ok(document) => {
                 let uri: Box<str> = uri.into();
                 let _was_unopened = self.unopened.remove(&uri);
+                self.held = held + document.text().len();
                 let _replaced = self.workspace.insert(uri.clone(), document);
                 let _stale = self.semantic.remove(&uri);
                 self.changed(&uri);
@@ -448,7 +488,27 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
             }
             None => edits,
         };
-        match apply(document, edits) {
+        let before = document.text().len();
+        // The most the text can grow to: a whole-text change replaces it, and
+        // every edit adds at most its own text.
+        let whole = edits.first().is_some_and(|edit| edit.range.is_none());
+        let start = if whole { 0 } else { before };
+        let most = edits.iter().fold(start, |sum: usize, edit| {
+            sum.saturating_add(edit.text.len())
+        });
+        if (self.held - before).saturating_add(most) > self.limit.bytes {
+            document.mark_stale();
+            let message = format!(
+                "`{uri}` is out of step: a change would take the open documents past {} bytes, \
+                 the most this server holds; keeping version {} until {RESYNC}",
+                self.limit.bytes,
+                document.version()
+            );
+            return self.wire.log(MessageType::Error, &message);
+        }
+        let outcome = apply(document, edits);
+        self.held = self.held - before + document.text().len();
+        match outcome {
             Ok(recovered) => {
                 document.synced(version);
                 if let Some(fault) = recovered {
@@ -488,6 +548,16 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
             .filter(|_| failed_open)
             .and_then(|at| edits.get(at))
             .map(|edit| edit.text.clone());
+        let size = text.as_ref().map_or(0, String::len);
+        if self.held.saturating_add(size) > self.limit.bytes {
+            let message = format!(
+                "could not open `{uri}` from a whole-text change: its {size} bytes would take \
+                 the open documents past {} bytes, the most this server holds",
+                self.limit.bytes
+            );
+            self.wire.log(MessageType::Error, &message);
+            return false;
+        }
         let Some(text) = text else {
             let message = if failed_open {
                 format!(
@@ -503,6 +573,7 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
         match guarded(|| Document::open(grammar, uri, version, text, encoding)) {
             Ok(document) => {
                 let _was_unopened = self.unopened.remove(uri);
+                self.held += document.text().len();
                 let _fresh = self.workspace.insert(uri.into(), document);
                 true
             }
@@ -517,7 +588,8 @@ impl<'h, G: Grammar + Clone, H: Handler<G>> Session<'h, G, H> {
     fn did_close(&mut self, uri: &str) {
         let _was_unopened = self.unopened.remove(uri);
         let _stale = self.semantic.remove(uri);
-        if self.workspace.remove(uri).is_some() {
+        if let Some(document) = self.workspace.remove(uri) {
+            self.held -= document.text().len();
             self.contained(
                 || format!("`textDocument/didClose` for `{uri}`"),
                 |handler, cx| handler.closed(uri, cx),

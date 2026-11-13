@@ -15,11 +15,18 @@ use crate::{
     handler::Handler,
     jobs::{Frontend, router},
     outbox::{BufferSink, Outbox},
-    session::Session,
+    session::{DocumentLimit, Session},
 };
 
-/// Default for [`Server::with_message_limit`]: 256 MiB.
-const DEFAULT_MESSAGE_LIMIT: usize = 256 * 1024 * 1024;
+/// Default for [`Server::with_message_limit`]: 64 MiB.
+const DEFAULT_MESSAGE_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Default for [`Server::with_document_limit`]: 4096 documents and 512 MiB of
+/// text between them.
+const DEFAULT_DOCUMENT_LIMIT: DocumentLimit = DocumentLimit {
+    count: 4096,
+    bytes: 512 * 1024 * 1024,
+};
 
 /// Most jobs allowed to queue before they are run even though more input is
 /// buffered. The queue is bounded anyway by one read's worth of messages and
@@ -113,6 +120,7 @@ pub struct Server<G, H> {
     grammar: G,
     handler: H,
     limits: Limits,
+    documents: DocumentLimit,
     info: Option<(String, String)>,
     custom_requests: Vec<Box<str>>,
     custom_notifications: Vec<Box<str>>,
@@ -160,13 +168,14 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
             grammar,
             handler,
             limits: limits_for(DEFAULT_MESSAGE_LIMIT),
+            documents: DEFAULT_DOCUMENT_LIMIT,
             info: None,
             custom_requests: Vec::new(),
             custom_notifications: Vec::new(),
         }
     }
 
-    /// Sets the largest message body accepted, in bytes. The default is 256
+    /// Sets the largest message body accepted, in bytes. The default is 64
     /// MiB.
     ///
     /// The limit bounds the memory a single message can claim. A message that
@@ -213,6 +222,56 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
     #[must_use]
     pub fn with_message_limit(mut self, bytes: usize) -> Self {
         self.limits = limits_for(bytes);
+        self
+    }
+
+    /// Sets the most documents the server holds open at once, and the most
+    /// bytes of text they may hold between them. The defaults are 4096
+    /// documents and 512 MiB.
+    ///
+    /// Each open document costs its text plus its syntax tree, and the client
+    /// decides how many to open, so the server caps both. A `didOpen` past
+    /// either cap is refused with a `window/logMessage` and the document stays
+    /// closed; a `didChange` that would grow the text past the byte cap is
+    /// refused the same way and the document is kept, out of step, at its last
+    /// version until the client sends its whole text again. Closing documents
+    /// frees room. Documents whose `didOpen` failed count toward the document
+    /// cap until they are closed.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use lsp_lang::incremental_lang::{Builder, Grammar, Span, Token, TokenKind};
+    /// # #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    /// # enum K { Root, Text }
+    /// # impl TokenKind for K {}
+    /// # #[derive(Clone)]
+    /// # struct Plain;
+    /// # impl Grammar for Plain {
+    /// #     type Kind = K;
+    /// #     const ROOT: K = K::Root;
+    /// #     fn lex(&self, text: &str, tokens: &mut Vec<Token<K>>) {
+    /// #         if !text.is_empty() { tokens.push(Token::new(K::Text, Span::new(0, text.len() as u32))); }
+    /// #     }
+    /// #     fn parse(&self, _: K, b: &mut Builder<'_, K>) {
+    /// #         b.start(K::Root);
+    /// #         while !b.at_end() { b.bump(); }
+    /// #         b.finish();
+    /// #     }
+    /// # }
+    /// # struct SyncOnly;
+    /// # impl lsp_lang::Handler<Plain> for SyncOnly {}
+    /// use lsp_lang::Server;
+    ///
+    /// // A server for a shared host: at most 64 documents, 16 MiB between them.
+    /// let server = Server::new(Plain, SyncOnly).with_document_limit(64, 16 << 20);
+    /// ```
+    #[must_use]
+    pub fn with_document_limit(mut self, documents: usize, bytes: usize) -> Self {
+        self.documents = DocumentLimit {
+            count: documents,
+            bytes,
+        };
         self
     }
 
@@ -469,6 +528,7 @@ impl<G: Grammar + Clone, H: Handler<G>> Server<G, H> {
             &mut self.handler,
             wire,
             self.info.clone(),
+            self.documents,
         );
         let mut transport = Transport {
             endpoint: &mut endpoint,
@@ -651,6 +711,8 @@ impl<G, H> fmt::Debug for Server<G, H> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Server")
             .field("message_limit", &self.limits.max_message_bytes)
+            .field("document_limit", &self.documents.count)
+            .field("document_bytes_limit", &self.documents.bytes)
             .finish_non_exhaustive()
     }
 }
